@@ -85,7 +85,33 @@ mkdir -p ~/.buck/inbox ~/.buck/outbox ~/.buck/logs
 chmod +x ~/Mac\ Projects/buck/buck-review.sh
 ```
 
-## Step 7: Test
+## Step 7: Configure Claude Code integration
+
+Buck works with Claude Code via CLAUDE.md instruction files.
+
+### Project-level (per project)
+
+The `CLAUDE.md` in the Buck repo teaches Claude Code the basic mechanics (how to call the script, parse JSON, handle retries). For other projects that should use Buck, copy it:
+
+```bash
+cp ~/Mac\ Projects/buck/CLAUDE.md /path/to/your-project/CLAUDE.md
+```
+
+### Global (all projects)
+
+To make Claude Code use Buck as an automatic reviewer everywhere — GPT reviews every plan and every edit:
+
+```bash
+# If you don't have a global CLAUDE.md yet:
+cp ~/Mac\ Projects/buck/examples/global-claude-md.md ~/.claude/CLAUDE.md
+
+# If you already have one, append:
+cat ~/Mac\ Projects/buck/examples/global-claude-md.md >> ~/.claude/CLAUDE.md
+```
+
+> **Path note:** If you cloned Buck somewhere other than `~/Mac Projects/buck/`, update the `buck-review.sh` path in both CLAUDE.md files.
+
+## Step 8: Test
 
 ```bash
 # Ensure Buck is running
