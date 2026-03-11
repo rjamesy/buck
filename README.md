@@ -1,5 +1,7 @@
 # Buck
 
+> Let your AI coding agents talk to each other. Claude writes the code, GPT reviews it — automatically.
+
 A macOS menu bar app that bridges AI coding assistants (Claude Code, Codex, etc.) with the ChatGPT desktop app. Buck automates the copy-paste review loop: your coding agent writes a plan, Buck sends it to ChatGPT via the Accessibility API, ChatGPT reviews it, and Buck pipes the feedback back — all without you touching the keyboard.
 
 ## How It Works
@@ -205,6 +207,10 @@ These aren't slash commands — they're natural language triggers that Claude Co
 - ChatGPT desktop app (installed and open with a visible window)
 - Accessibility permission granted to Buck
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). PRs welcome — especially for response detection improvements, AX tree resilience, and new AI target support.
+
 ## License
 
-Private project.
+MIT — see [LICENSE](LICENSE).
