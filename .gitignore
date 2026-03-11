@@ -1,0 +1,18 @@
+# Xcode
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+build/
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Buck runtime
+.buck/
+
+# Temp files
+*.tmp
+/tmp/
