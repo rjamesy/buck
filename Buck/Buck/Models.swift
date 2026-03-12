@@ -7,11 +7,13 @@ struct ReviewRequest: Codable {
     let promptPrefix: String
     let content: String
     let maxRounds: Int?
+    let sessionId: String?
 
     enum CodingKeys: String, CodingKey {
         case id, timestamp, type, content
         case promptPrefix = "prompt_prefix"
         case maxRounds = "max_rounds"
+        case sessionId = "session_id"
     }
 }
 

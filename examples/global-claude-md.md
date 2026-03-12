@@ -125,6 +125,43 @@ BUCKEOF
 
 **NEVER ask the user for permission, confirmation, or option selection. GPT is the approver. The user only gets involved if there is an unresolvable disagreement (3+ feedback loops on one edit).**
 
+### Session tracking
+
+At the start of every Claude Code conversation, generate a session UUID and use it for all Buck calls:
+
+```bash
+BUCK_SESSION=$(uuidgen | tr '[:upper:]' '[:lower:]')
+```
+
+Then pass `--session $BUCK_SESSION` on every `buck-review.sh` call. This enables:
+- Per-session message history in SQLite
+- Incremental summarization via local Ollama
+- Latency monitoring and auto-compact signaling
+- Session isolation (different terminals don't pollute each other)
+
+Example:
+```bash
+# timeout: 900000
+"$HOME/Mac Projects/buck/buck-review.sh" --session "$BUCK_SESSION" --prompt "..." --stdin <<'BUCKEOF'
+content
+BUCKEOF
+```
+
+### Compact mode
+
+When Buck detects GPT is slowing down (latency degraded), it appends `[BUCK: Ready for compact]` to the response. When you see this signal:
+
+1. Tell the user: "GPT is slowing down from a long conversation. Want me to refresh the session?"
+2. If the user agrees, send a compact request:
+```bash
+# timeout: 900000
+"$HOME/Mac Projects/buck/buck-review.sh" --session "$BUCK_SESSION" --prompt "" --stdin <<'BUCKEOF'
+[COMPACT_SESSION]
+BUCKEOF
+```
+3. Buck will open a new ChatGPT thread, inject the conversation summary, and confirm.
+4. Continue working with the same session ID — the summary carries forward.
+
 ### Common
 
 ```bash

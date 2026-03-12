@@ -13,6 +13,9 @@
 		AA000004 /* FileWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000004; };
 		AA000005 /* ResponseWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000005; };
 		AA000006 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000006; };
+		AA000007 /* ChatHistoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000008; };
+		AA000008 /* OllamaSummarizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000009; };
+		AA000009 /* SessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000010; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -23,6 +26,9 @@
 		AB000005 /* ResponseWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResponseWriter.swift; sourceTree = "<group>"; };
 		AB000006 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		AB000007 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		AB000008 /* ChatHistoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatHistoryStore.swift; sourceTree = "<group>"; };
+		AB000009 /* OllamaSummarizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OllamaSummarizer.swift; sourceTree = "<group>"; };
+		AB000010 /* SessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionManager.swift; sourceTree = "<group>"; };
 		AC000001 /* Buck.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Buck.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -54,6 +60,9 @@
 				AB000004 /* FileWatcher.swift */,
 				AB000005 /* ResponseWriter.swift */,
 				AB000006 /* Models.swift */,
+				AB000008 /* ChatHistoryStore.swift */,
+				AB000009 /* OllamaSummarizer.swift */,
+				AB000010 /* SessionManager.swift */,
 				AB000007 /* Info.plist */,
 			);
 			path = Buck;
@@ -144,6 +153,9 @@
 				AA000004 /* FileWatcher.swift in Sources */,
 				AA000005 /* ResponseWriter.swift in Sources */,
 				AA000006 /* Models.swift in Sources */,
+				AA000007 /* ChatHistoryStore.swift in Sources */,
+				AA000008 /* OllamaSummarizer.swift in Sources */,
+				AA000009 /* SessionManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

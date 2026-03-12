@@ -33,6 +33,7 @@ Keep each section short and specific. Do not rewrite the whole plan."
 # Parse args
 PROMPT="$DEFAULT_PROMPT"
 CONTENT=""
+SESSION_ID=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -54,6 +55,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --retries)
             MAX_RETRIES="$2"
+            shift 2
+            ;;
+        --session)
+            SESSION_ID="$2"
             shift 2
             ;;
         *)
@@ -98,12 +103,19 @@ while [ $attempt -le $MAX_RETRIES ]; do
     # Clean any previous response
     rm -f "$OUTBOX/$ID.json"
 
+    # Build optional session_id field
+    SESSION_FIELD=""
+    if [[ -n "$SESSION_ID" ]]; then
+        SESSION_FIELD="\"session_id\": \"$SESSION_ID\","
+    fi
+
     # Write request (atomic: write tmp then rename)
     cat > "$INBOX/$ID.tmp" << ENDJSON
 {
   "id": "$ID",
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "type": "review_request",
+  $SESSION_FIELD
   "prompt_prefix": $PROMPT_ESCAPED,
   "content": $CONTENT_ESCAPED,
   "max_rounds": 1

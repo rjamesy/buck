@@ -47,6 +47,9 @@ No network calls. No API keys. Just file-based IPC and the Accessibility API.
 - **Atomic file writes** — write to `.tmp`, rename to `.json` (no partial reads)
 - **Structured prompts** — default prompt enforces strict APPROVED/FEEDBACK first-line contract with `<plan>` tag isolation
 - **Truncation handling** — clicks "Show full message", "See more", "Scroll to bottom" automatically
+- **Session management** — tracks conversations in SQLite, monitors GPT latency, auto-compacts long threads
+- **Incremental summarization** — local Ollama (qwen2.5:3b-instruct) summarizes every turn for context preservation
+- **Auto-compact** — when GPT slows down, signals Claude to refresh the thread with an injected summary
 - **Detailed logging** — all activity logged to `~/.buck/logs/buck.log`
 
 ## Architecture
@@ -58,7 +61,10 @@ Buck/Buck/
 ├── ChatGPTBridge.swift     Accessibility API: send messages, read responses, poll for completion
 ├── FileWatcher.swift       DispatchSource + timer fallback watching ~/.buck/inbox/
 ├── ResponseWriter.swift    Atomic JSON writes to ~/.buck/outbox/
-└── Models.swift            ReviewRequest / ReviewResponse codables
+├── Models.swift            ReviewRequest / ReviewResponse codables
+├── SessionManager.swift    Session tracking, latency monitoring, compact orchestration
+├── ChatHistoryStore.swift  SQLite persistence for sessions and messages
+└── OllamaSummarizer.swift  Local LLM summarization via Ollama
 ```
 
 | Component | Role |
@@ -68,7 +74,10 @@ Buck/Buck/
 | **ChatGPTBridge** | Core engine. Navigates the ChatGPT AX tree (Window → Group → SplitGroup → ChatPane → ScrollArea → List → MessageGroups). Sends messages by setting AXTextArea value and pressing the AXButton with AXHelp "Send message". Polls for response completion using text stability, send button state, and group count heuristics. |
 | **FileWatcher** | Dual-mode file detection: DispatchSource for instant notification, 2-second timer fallback for reliability. Only processes `.json` files; cleans stale `.tmp` on startup. |
 | **ResponseWriter** | Writes response JSON atomically (`.tmp` → `.json` rename). |
-| **Models** | `ReviewRequest` (id, timestamp, type, promptPrefix, content, maxRounds) and `ReviewResponse` (id, timestamp, status, response, round). Snake-case JSON coding keys. |
+| **Models** | `ReviewRequest` (id, timestamp, type, promptPrefix, content, maxRounds, sessionId) and `ReviewResponse` (id, timestamp, status, response, round). Snake-case JSON coding keys. |
+| **SessionManager** | Caches incoming requests, records completed request-response pairs in SQLite, triggers async Ollama summarization, checks latency trends, signals when compact is needed. |
+| **ChatHistoryStore** | SQLite (macOS C library, no SPM) with three tables: `claude_sessions` (per-terminal), `gpt_sessions` (per-ChatGPT-thread), `messages`. 7-day retention with auto-cleanup. |
+| **OllamaSummarizer** | HTTP POST to local Ollama (`localhost:11434`). Uses `qwen2.5:3b-instruct` for incremental conversation summarization. Fire-and-forget — never blocks the review loop. |
 
 ### AX Tree Path
 
@@ -189,6 +198,7 @@ These aren't slash commands — they're natural language triggers that Claude Co
 | `--prompt "..."` | Structured review prompt | Custom system prompt for GPT |
 | `--stdin` | — | Read content from stdin |
 | `--text "..."` | — | Inline content (use --stdin for long text) |
+| `--session ID` | — | Session UUID for history tracking and compact |
 | `--timeout N` | 720 | Seconds to wait for response |
 | `--retries N` | 2 | Max retries on error |
 
@@ -199,6 +209,7 @@ These aren't slash commands — they're natural language triggers that Claude Co
 | `~/.buck/inbox/` | Incoming review requests (JSON) |
 | `~/.buck/outbox/` | Outgoing review responses (JSON) |
 | `~/.buck/logs/buck.log` | Debug log |
+| `~/.buck/history.db` | SQLite session history (auto-created, 7-day retention) |
 
 ## Requirements
 
@@ -206,6 +217,7 @@ These aren't slash commands — they're natural language triggers that Claude Co
 - Xcode 15+ (to build)
 - ChatGPT desktop app (installed and open with a visible window)
 - Accessibility permission granted to Buck
+- Ollama with `qwen2.5:3b-instruct` model (optional — for session summarization)
 
 ## Contributing
 

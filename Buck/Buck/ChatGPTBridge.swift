@@ -374,6 +374,44 @@ final class ChatGPTBridge {
         }
     }
 
+    // MARK: - New Chat (compact only)
+
+    /// Start a new ChatGPT thread. Only used during session compaction.
+    func startNewChat() {
+        guard let app = appElement,
+              let window = getFirstWindow(app) else {
+            Self.log("startNewChat: no window")
+            return
+        }
+
+        // Look for the "New chat" button in the sidebar or toolbar
+        if let newChatBtn = findElement(in: window, role: kAXButtonRole, matcher: { el in
+            let desc = self.getStringAttribute(el, kAXDescriptionAttribute) ?? ""
+            let help = self.getStringAttribute(el, kAXHelpAttribute) ?? ""
+            return desc.contains("New chat") || help.contains("New chat") ||
+                   desc.contains("New Chat") || help.contains("New Chat")
+        }) {
+            AXUIElementPerformAction(newChatBtn, kAXPressAction as CFString)
+            Self.log("startNewChat: clicked 'New chat' button")
+            Thread.sleep(forTimeInterval: 1.0)
+            return
+        }
+
+        // Fallback: Cmd+N keyboard shortcut
+        Self.log("startNewChat: 'New chat' button not found, trying Cmd+N")
+        let src = CGEventSource(stateID: .combinedSessionState)
+        let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x2D, keyDown: true) // N key
+        keyDown?.flags = .maskCommand
+        let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 0x2D, keyDown: false)
+        keyUp?.flags = .maskCommand
+
+        let chatGPTPid = self.chatGPTPid
+        keyDown?.postToPid(chatGPTPid)
+        keyUp?.postToPid(chatGPTPid)
+        Thread.sleep(forTimeInterval: 1.0)
+        Self.log("startNewChat: sent Cmd+N")
+    }
+
     // MARK: - AX Tree Navigation
 
     private func getFirstWindow(_ app: AXUIElement) -> AXUIElement? {
