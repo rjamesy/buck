@@ -50,6 +50,7 @@ No network calls. No API keys. Just file-based IPC and the Accessibility API.
 - **Session management** — tracks conversations in SQLite, monitors GPT latency, auto-compacts long threads
 - **Incremental summarization** — local Ollama (qwen2.5:3b-instruct) summarizes every turn for context preservation
 - **Auto-compact** — when GPT slows down, signals Claude to refresh the thread with an injected summary
+- **Multi-channel** — run parallel Claude Code sessions, each targeting a different ChatGPT window (main vs companion chat)
 - **Detailed logging** — all activity logged to `~/.buck/logs/buck.log`
 
 ## Architecture
@@ -103,6 +104,40 @@ The hardest problem Buck solves: knowing when GPT is done generating. It uses th
 3. **Identical response with new groups** — handles repeated responses (e.g. "APPROVED" twice) by checking message group count increased
 
 ## Usage
+
+### Multi-channel
+
+Buck supports independent channels so multiple Claude Code sessions can each talk to their own ChatGPT window simultaneously:
+
+| Channel | ChatGPT window | AX subrole |
+|---------|---------------|------------|
+| `a` (default) | Main window | `AXStandardWindow` |
+| `b` | Companion chat | `AXSystemDialog` |
+
+Set the channel via the `BUCK_CHANNEL` environment variable or the `--channel` flag:
+
+```bash
+# Via env var
+BUCK_CHANNEL=b buck-review.sh --stdin <<'BUCKEOF'
+content
+BUCKEOF
+
+# Via flag
+buck-review.sh --channel b --stdin <<'BUCKEOF'
+content
+BUCKEOF
+```
+
+#### Shell aliases for multi-channel Claude Code
+
+Add these to `~/.zshrc` to launch Claude Code sessions pre-configured for a specific channel:
+
+```bash
+alias claude-a='BUCK_CHANNEL=a claude --allow-dangerously-skip-permissions'
+alias claude-b='BUCK_CHANNEL=b claude --allow-dangerously-skip-permissions'
+```
+
+Then run `claude-a` in one terminal and `claude-b` in another — each session's reviews go to a different ChatGPT window.
 
 ### From the command line
 
@@ -200,6 +235,7 @@ These aren't slash commands — they're natural language triggers that Claude Co
 | `--text "..."` | — | Inline content (use --stdin for long text) |
 | `--session ID` | — | Session UUID for history tracking and compact |
 | `--timeout N` | 720 | Seconds to wait for response |
+| `--channel X` | `$BUCK_CHANNEL` or none | Target channel (`a` = main window, `b` = companion chat) |
 | `--retries N` | 2 | Max retries on error |
 
 ## Runtime directories

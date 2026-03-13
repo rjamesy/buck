@@ -2,9 +2,15 @@ import ApplicationServices
 import AppKit
 
 final class ChatGPTBridge {
+    /// Which window this bridge targets: "AXStandardWindow" (main) or "AXSystemDialog" (companion)
+    let targetSubrole: String
     private var appElement: AXUIElement?
     private var chatGPTPid: pid_t = 0
     private var lastTerminalCheckTime: Date?
+
+    init(targetSubrole: String = "AXStandardWindow") {
+        self.targetSubrole = targetSubrole
+    }
 
     static func log(_ msg: String) {
         let logFile = FileManager.default.homeDirectoryForCurrentUser
@@ -150,7 +156,7 @@ final class ChatGPTBridge {
         guard let app = appElement,
               let window = getFirstWindow(app),
               let chatPane = findChatPane(in: window),
-              let messagesScrollArea = findFirstChild(of: chatPane, role: kAXScrollAreaRole),
+              let messagesScrollArea = findMessagesScrollArea(in: chatPane),
               let outerList = findFirstChild(of: messagesScrollArea, role: kAXListRole),
               let innerList = findFirstChild(of: outerList, role: kAXListRole) else {
             return 0
@@ -172,7 +178,7 @@ final class ChatGPTBridge {
             throw BuckError.chatPaneNotFound
         }
 
-        guard let messagesScrollArea = findFirstChild(of: chatPane, role: kAXScrollAreaRole) else {
+        guard let messagesScrollArea = findMessagesScrollArea(in: chatPane) else {
             throw BuckError.messagesNotFound
         }
 
@@ -415,38 +421,41 @@ final class ChatGPTBridge {
     // MARK: - AX Tree Navigation
 
     private func getFirstWindow(_ app: AXUIElement) -> AXUIElement? {
-        // Prefer the focused window to avoid targeting the wrong conversation
-        var focused: CFTypeRef?
-        if AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &focused) == .success,
-           let focusedWindow = focused as! AXUIElement? {
-            return focusedWindow
-        }
-        // Fall back to first window only if no focused window
         var value: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
-        guard err == .success, let windows = value as? [AXUIElement], let first = windows.first else {
+        guard err == .success, let windows = value as? [AXUIElement] else {
             return nil
         }
-        return first
+        // Find the window matching our target subrole
+        for win in windows {
+            let subrole = getStringAttribute(win, kAXSubroleAttribute) ?? ""
+            if subrole == targetSubrole {
+                return win
+            }
+        }
+        // Fallback: if only one window exists, use it regardless of subrole
+        if windows.count == 1 {
+            return windows.first
+        }
+        Self.log("No window with subrole \(targetSubrole) found (\(windows.count) windows)")
+        return nil
     }
 
     private func findChatPane(in window: AXUIElement) -> AXUIElement? {
-        // Window > Group[0] > SplitGroup > Group[2] (the chat pane with many children)
         let windowChildren = getChildren(of: window)
         guard let mainGroup = windowChildren.first(where: { getRole($0) == kAXGroupRole }) else {
             return nil
         }
 
+        // Main window: Group → SplitGroup → Group(max children)
         let mainGroupChildren = getChildren(of: mainGroup)
-        guard let splitGroup = mainGroupChildren.first(where: {
-            getRole($0) == "AXSplitGroup"
-        }) else {
-            return nil
+        if let splitGroup = mainGroupChildren.first(where: { getRole($0) == "AXSplitGroup" }) {
+            let groups = getChildren(of: splitGroup).filter { getRole($0) == kAXGroupRole }
+            return groups.max(by: { getChildren(of: $0).count < getChildren(of: $1).count })
         }
 
-        // Chat pane is the group with the most children (11 typically)
-        let groups = getChildren(of: splitGroup).filter { getRole($0) == kAXGroupRole }
-        return groups.max(by: { getChildren(of: $0).count < getChildren(of: $1).count })
+        // Companion chat: the first AXGroup child IS the chat pane (no sidebar/SplitGroup)
+        return mainGroup
     }
 
     private func expandAndScroll(in window: AXUIElement) {
@@ -514,6 +523,19 @@ final class ChatGPTBridge {
 
     private func findFirstChild(of element: AXUIElement, role: String) -> AXUIElement? {
         return getChildren(of: element).first { getRole($0) == role }
+    }
+
+    /// Find the messages scroll area — the one containing an AXList (not the input text area)
+    private func findMessagesScrollArea(in chatPane: AXUIElement) -> AXUIElement? {
+        for child in getChildren(of: chatPane) {
+            if getRole(child) == kAXScrollAreaRole {
+                // The messages scroll area contains an AXList; the input scroll area contains AXTextArea
+                if getChildren(of: child).contains(where: { getRole($0) == kAXListRole }) {
+                    return child
+                }
+            }
+        }
+        return nil
     }
 
     private func findLastMessageGroup(in groups: [AXUIElement]) -> AXUIElement? {

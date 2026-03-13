@@ -8,9 +8,10 @@ struct ReviewRequest: Codable {
     let content: String
     let maxRounds: Int?
     let sessionId: String?
+    let channel: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, timestamp, type, content
+        case id, timestamp, type, content, channel
         case promptPrefix = "prompt_prefix"
         case maxRounds = "max_rounds"
         case sessionId = "session_id"

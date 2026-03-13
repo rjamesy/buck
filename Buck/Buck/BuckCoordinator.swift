@@ -8,14 +8,29 @@ class BuckCoordinator: ObservableObject {
     @Published var lastRoundInfo: String?
 
     private var fileWatcher: FileWatcher?
-    private let bridge = ChatGPTBridge()
     private let writer = ResponseWriter()
-    private let processingLock = NSLock()
-    private var isProcessing = false
-    private var activeRequestId: String?
     private let sessionManager = SessionManager()
 
+    // Per-channel state
+    private struct ChannelState {
+        let bridge: ChatGPTBridge
+        var isProcessing = false
+        var activeRequestId: String?
+    }
+
+    private static let channelSubroles: [String: String] = [
+        "a": "AXStandardWindow",   // main ChatGPT window
+        "b": "AXSystemDialog",     // companion chat window
+    ]
+
+    private var channels: [String: ChannelState] = [:]
+    private let channelLock = NSLock()
+
     init() {
+        // Create a bridge per channel, each targeting a different window subrole
+        for (name, subrole) in Self.channelSubroles {
+            channels[name] = ChannelState(bridge: ChatGPTBridge(targetSubrole: subrole))
+        }
         checkAccessibility()
         startWatching()
     }
@@ -56,17 +71,34 @@ class BuckCoordinator: ObservableObject {
         // Cache request for session tracking
         sessionManager.cacheRequest(request)
 
-        // Handle compact requests — separate flow
-        if request.content.hasPrefix("[COMPACT_SESSION]") {
-            await handleCompact(request: request, url: url)
+        // Resolve channel (default "a" for backwards compatibility)
+        let channelName = request.channel ?? "a"
+        guard channels[channelName] != nil else {
+            ChatGPTBridge.log("[req:\(request.id)] Unknown channel: \(channelName)")
+            let response = ReviewResponse(
+                id: request.id,
+                timestamp: ISO8601DateFormatter().string(from: Date()),
+                status: .error,
+                response: "Unknown channel: \(channelName)",
+                round: 1
+            )
+            try? writer.write(response)
+            try? FileManager.default.removeItem(at: url)
             return
         }
 
-        // Concurrency check
-        processingLock.lock()
-        if isProcessing {
-            processingLock.unlock()
-            ChatGPTBridge.log("[req:\(request.id)] Rejected — another message is in flight (active: \(activeRequestId ?? "unknown"))")
+        // Handle compact requests — separate flow
+        if request.content.hasPrefix("[COMPACT_SESSION]") {
+            await handleCompact(request: request, channel: channelName, url: url)
+            return
+        }
+
+        // Per-channel concurrency check
+        channelLock.lock()
+        if channels[channelName]!.isProcessing {
+            let activeId = channels[channelName]!.activeRequestId ?? "unknown"
+            channelLock.unlock()
+            ChatGPTBridge.log("[req:\(request.id)] Rejected — channel \(channelName) in flight (active: \(activeId))")
             let response = ReviewResponse(
                 id: request.id,
                 timestamp: ISO8601DateFormatter().string(from: Date()),
@@ -78,20 +110,22 @@ class BuckCoordinator: ObservableObject {
             try? FileManager.default.removeItem(at: url)
             return
         }
-        isProcessing = true
-        activeRequestId = request.id
-        processingLock.unlock()
+        channels[channelName]!.isProcessing = true
+        channels[channelName]!.activeRequestId = request.id
+        channelLock.unlock()
 
         defer {
-            processingLock.lock()
-            isProcessing = false
-            activeRequestId = nil
-            processingLock.unlock()
+            channelLock.lock()
+            channels[channelName]!.isProcessing = false
+            channels[channelName]!.activeRequestId = nil
+            channelLock.unlock()
         }
 
+        let bridge = channels[channelName]!.bridge
+
         do {
-            ChatGPTBridge.log("[req:\(request.id)] Processing started")
-            statusText = "Processing: \(request.id)"
+            ChatGPTBridge.log("[req:\(request.id)] Processing started (channel \(channelName))")
+            statusText = "[\(channelName)] Processing: \(request.id)"
             menuBarIcon = "circle.fill"
             lastRoundInfo = nil
 
@@ -100,12 +134,12 @@ class BuckCoordinator: ObservableObject {
             _ = try bridge.findChatGPT()
 
             // Send to ChatGPT
-            statusText = "Sending to ChatGPT..."
-            ChatGPTBridge.log("[req:\(request.id)] Sending to ChatGPT...")
+            statusText = "[\(channelName)] Sending to ChatGPT..."
+            ChatGPTBridge.log("[req:\(request.id)] Sending to ChatGPT (channel \(channelName))...")
             try bridge.sendMessage(prompt)
 
-            // Wait for response (single window — no resend on timeout)
-            statusText = "Waiting for GPT..."
+            // Wait for response
+            statusText = "[\(channelName)] Waiting for GPT..."
             ChatGPTBridge.log("[req:\(request.id)] Waiting for response")
             let responseText: String
             do {
@@ -144,15 +178,15 @@ class BuckCoordinator: ObservableObject {
 
             ChatGPTBridge.log("[req:\(request.id)] Response written — \(isApproved ? "approved" : "feedback")")
 
-            statusText = isApproved ? "Approved: \(request.id)" : "Feedback: \(request.id)"
+            statusText = isApproved ? "[\(channelName)] Approved" : "[\(channelName)] Feedback"
             menuBarIcon = "circle"
-            lastRoundInfo = "Last: \(request.id) (\(isApproved ? "approved" : "feedback"))"
+            lastRoundInfo = "[\(channelName)] \(request.id) (\(isApproved ? "approved" : "feedback"))"
 
             try? FileManager.default.removeItem(at: url)
 
         } catch {
             ChatGPTBridge.log("[req:\(request.id)] Error: \(error.localizedDescription)")
-            statusText = "Error: \(error.localizedDescription)"
+            statusText = "[\(channelName)] Error: \(error.localizedDescription)"
             menuBarIcon = "xmark.circle"
 
             let response = ReviewResponse(
@@ -169,11 +203,11 @@ class BuckCoordinator: ObservableObject {
 
     // MARK: - Session Compact
 
-    private func handleCompact(request: ReviewRequest, url: URL) async {
-        processingLock.lock()
-        if isProcessing {
-            processingLock.unlock()
-            ChatGPTBridge.log("[req:\(request.id)] Compact rejected — another message is in flight")
+    private func handleCompact(request: ReviewRequest, channel channelName: String, url: URL) async {
+        channelLock.lock()
+        if channels[channelName]!.isProcessing {
+            channelLock.unlock()
+            ChatGPTBridge.log("[req:\(request.id)] Compact rejected — channel \(channelName) in flight")
             let response = ReviewResponse(
                 id: request.id,
                 timestamp: ISO8601DateFormatter().string(from: Date()),
@@ -185,20 +219,21 @@ class BuckCoordinator: ObservableObject {
             try? FileManager.default.removeItem(at: url)
             return
         }
-        isProcessing = true
-        activeRequestId = request.id
-        processingLock.unlock()
+        channels[channelName]!.isProcessing = true
+        channels[channelName]!.activeRequestId = request.id
+        channelLock.unlock()
 
         defer {
-            processingLock.lock()
-            isProcessing = false
-            activeRequestId = nil
-            processingLock.unlock()
+            channelLock.lock()
+            channels[channelName]!.isProcessing = false
+            channels[channelName]!.activeRequestId = nil
+            channelLock.unlock()
         }
 
+        let bridge = channels[channelName]!.bridge
         let sessionId = request.sessionId ?? "default"
-        ChatGPTBridge.log("[req:\(request.id)] Compact started for session \(sessionId)")
-        statusText = "Compacting session..."
+        ChatGPTBridge.log("[req:\(request.id)] Compact started for session \(sessionId) (channel \(channelName))")
+        statusText = "[\(channelName)] Compacting session..."
         menuBarIcon = "circle.fill"
 
         let rawSummary = sessionManager.getSummary(forClaudeSession: sessionId)
@@ -230,13 +265,13 @@ class BuckCoordinator: ObservableObject {
             try writer.write(response)
 
             ChatGPTBridge.log("[req:\(request.id)] Compact complete for session \(sessionId)")
-            statusText = "Compacted: \(sessionId)"
+            statusText = "[\(channelName)] Compacted: \(sessionId)"
             menuBarIcon = "circle"
-            lastRoundInfo = "Compacted session \(sessionId.prefix(8))"
+            lastRoundInfo = "[\(channelName)] Compacted \(sessionId.prefix(8))"
 
         } catch {
             ChatGPTBridge.log("[req:\(request.id)] Compact error: \(error.localizedDescription)")
-            statusText = "Compact error"
+            statusText = "[\(channelName)] Compact error"
             menuBarIcon = "xmark.circle"
 
             let response = ReviewResponse(

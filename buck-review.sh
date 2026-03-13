@@ -34,6 +34,7 @@ Keep each section short and specific. Do not rewrite the whole plan."
 PROMPT="$DEFAULT_PROMPT"
 CONTENT=""
 SESSION_ID=""
+CHANNEL="${BUCK_CHANNEL:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -59,6 +60,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --session)
             SESSION_ID="$2"
+            shift 2
+            ;;
+        --channel)
+            CHANNEL="$2"
             shift 2
             ;;
         *)
@@ -103,10 +108,14 @@ while [ $attempt -le $MAX_RETRIES ]; do
     # Clean any previous response
     rm -f "$OUTBOX/$ID.json"
 
-    # Build optional session_id field
+    # Build optional fields
     SESSION_FIELD=""
     if [[ -n "$SESSION_ID" ]]; then
         SESSION_FIELD="\"session_id\": \"$SESSION_ID\","
+    fi
+    CHANNEL_FIELD=""
+    if [[ -n "$CHANNEL" ]]; then
+        CHANNEL_FIELD="\"channel\": \"$CHANNEL\","
     fi
 
     # Write request (atomic: write tmp then rename)
@@ -116,6 +125,7 @@ while [ $attempt -le $MAX_RETRIES ]; do
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "type": "review_request",
   $SESSION_FIELD
+  $CHANNEL_FIELD
   "prompt_prefix": $PROMPT_ESCAPED,
   "content": $CONTENT_ESCAPED,
   "max_rounds": 1
