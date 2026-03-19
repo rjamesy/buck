@@ -5,11 +5,14 @@
 #   buck-review.sh <plan_file>              # Send file contents for review
 #   buck-review.sh --text "plan text here"  # Send inline text
 #   buck-review.sh --prompt "custom prompt" <plan_file>  # Custom review prompt
+#   buck-review.sh --test                   # Smoke test: verify Buck + ChatGPT round-trip
 
 set -euo pipefail
 
 INBOX="$HOME/.buck/inbox"
 OUTBOX="$HOME/.buck/outbox"
+HISTORY="$HOME/.buck/history.jsonl"
+HISTORY_MAX_BYTES=10485760  # 10MB
 TIMEOUT=720  # 12 min — covers Buck's 2×5min windows + overhead
 MAX_RETRIES=2  # retry up to 2 times on error
 
@@ -30,11 +33,18 @@ Concrete changes
 
 Keep each section short and specific. Do not rewrite the whole plan."
 
-# Parse args
+# ─── Dependency check ────────────────────────────────────────────────
+if ! command -v python3 &>/dev/null; then
+    echo "Error: python3 is required but not found. Install Python 3." >&2
+    exit 1
+fi
+
+# ─── Parse args ──────────────────────────────────────────────────────
 PROMPT="$DEFAULT_PROMPT"
 CONTENT=""
 SESSION_ID=""
 CHANNEL="${BUCK_CHANNEL:-}"
+SMOKE_TEST=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -66,6 +76,10 @@ while [[ $# -gt 0 ]]; do
             CHANNEL="$2"
             shift 2
             ;;
+        --test)
+            SMOKE_TEST=true
+            shift
+            ;;
         *)
             if [[ -f "$1" ]]; then
                 CONTENT=$(cat "$1")
@@ -78,8 +92,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# ─── Smoke test mode ────────────────────────────────────────────────
+if $SMOKE_TEST; then
+    PROMPT="Reply with exactly one word: OK"
+    CONTENT="Smoke test"
+    TIMEOUT=60
+    MAX_RETRIES=1
+    echo "Running smoke test..." >&2
+fi
+
 if [[ -z "$CONTENT" ]]; then
     echo "Usage: buck-review.sh [--prompt \"...\"] [--text \"...\"] [plan_file]" >&2
+    echo "       buck-review.sh --test" >&2
     exit 1
 fi
 
@@ -91,6 +115,80 @@ fi
 
 # Ensure directories exist
 mkdir -p "$INBOX" "$OUTBOX"
+
+# ─── Logging helpers ────────────────────────────────────────────────
+
+# Rotate history log if over 10MB
+rotate_history() {
+    if [[ -f "$HISTORY" ]]; then
+        local size
+        size=$(stat -f%z "$HISTORY" 2>/dev/null || echo 0)
+        if [[ $size -gt $HISTORY_MAX_BYTES ]]; then
+            mv "$HISTORY" "${HISTORY}.old"
+            echo "History log rotated (was ${size} bytes)" >&2
+        fi
+    fi
+}
+
+# Log a request/response exchange to history.jsonl (atomic append)
+log_exchange() {
+    local request_id="$1"
+    local status="$2"
+    local response_text="$3"
+
+    rotate_history
+
+    local tmp_log
+    tmp_log=$(mktemp "${HISTORY}.tmp.XXXXXX")
+
+    python3 -c "
+import json, sys
+entry = {
+    'timestamp': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+    'request_id': sys.argv[1],
+    'prompt': sys.argv[2][:200],
+    'content': sys.argv[3][:500],
+    'status': sys.argv[4],
+    'response': sys.argv[5][:1000],
+}
+print(json.dumps(entry))
+" "$request_id" "$PROMPT" "$CONTENT" "$status" "$response_text" > "$tmp_log"
+
+    cat "$tmp_log" >> "$HISTORY"
+    rm -f "$tmp_log"
+}
+
+# Validate response JSON: must be valid JSON with required fields
+validate_response() {
+    local filepath="$1"
+
+    python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    if 'status' not in d:
+        print('missing_status')
+        sys.exit(0)
+    if 'response' not in d:
+        print('missing_response')
+        sys.exit(0)
+    # Normalize status to lowercase
+    d['status'] = d['status'].strip().lower()
+    # Validate status is known
+    if d['status'] not in ('approved', 'feedback', 'error'):
+        print('unknown_status:' + d['status'])
+        sys.exit(0)
+    # Write back normalized
+    with open(sys.argv[1], 'w') as f:
+        json.dump(d, f, indent=2)
+    print('valid')
+except (json.JSONDecodeError, Exception) as e:
+    print('invalid_json:' + str(e))
+" "$filepath"
+}
+
+# ─── Main loop ──────────────────────────────────────────────────────
 
 # Wrap content in <plan> tags for prompt isolation, then escape for JSON
 CONTENT_WRAPPED="<plan>
@@ -148,6 +246,43 @@ ENDJSON
 
     if [[ ! -f "$OUTBOX/$ID.json" ]]; then
         echo "Error: Timed out after ${TIMEOUT}s waiting for response" >&2
+        log_exchange "$ID" "error" "Timed out after ${TIMEOUT}s"
+        attempt=$((attempt + 1))
+        if [ $attempt -le $MAX_RETRIES ]; then
+            echo "Retrying..." >&2
+            sleep 2
+        fi
+        continue
+    fi
+
+    # Validate response is well-formed JSON with required fields
+    VALIDATION=$(validate_response "$OUTBOX/$ID.json")
+
+    if [[ "$VALIDATION" == invalid_json* ]]; then
+        echo "Error: Response is not valid JSON: $VALIDATION" >&2
+        log_exchange "$ID" "error" "Invalid JSON: $VALIDATION"
+        attempt=$((attempt + 1))
+        if [ $attempt -le $MAX_RETRIES ]; then
+            echo "Retrying..." >&2
+            sleep 2
+        fi
+        continue
+    fi
+
+    if [[ "$VALIDATION" == missing_* ]]; then
+        echo "Error: Response missing required field: $VALIDATION" >&2
+        log_exchange "$ID" "error" "Missing field: $VALIDATION"
+        attempt=$((attempt + 1))
+        if [ $attempt -le $MAX_RETRIES ]; then
+            echo "Retrying..." >&2
+            sleep 2
+        fi
+        continue
+    fi
+
+    if [[ "$VALIDATION" == unknown_status* ]]; then
+        echo "Error: Unknown status in response: $VALIDATION" >&2
+        log_exchange "$ID" "error" "Unknown status: $VALIDATION"
         attempt=$((attempt + 1))
         if [ $attempt -le $MAX_RETRIES ]; then
             echo "Retrying..." >&2
@@ -176,6 +311,7 @@ ENDJSON
             STRIPPED_LEN=${#STRIPPED}
             if [ $STRIPPED_LEN -lt 5 ]; then
                 echo "Attempt $((attempt+1)): GPT used screen tool without answering (len=$RESPONSE_LEN), retrying..." >&2
+                log_exchange "$ID" "error" "Tool-use only response: $RESPONSE_TEXT"
                 attempt=$((attempt + 1))
                 if [ $attempt -le $MAX_RETRIES ]; then
                     sleep 3
@@ -192,6 +328,24 @@ d['response'] = re.sub(r'^(Looked at (Terminal|Screen|the screen)|Focused on sel
 with open('$OUTBOX/$ID.json', 'w') as f: json.dump(d, f, indent=2)
 "
         fi
+
+        # Log the exchange
+        RESPONSE_TEXT=$(python3 -c "import json; print(json.load(open('$OUTBOX/$ID.json')).get('response',''))" 2>/dev/null || echo "")
+        log_exchange "$ID" "$STATUS" "$RESPONSE_TEXT"
+
+        # Smoke test: validate response contains "OK"
+        if $SMOKE_TEST; then
+            if echo "$RESPONSE_TEXT" | grep -qi "ok"; then
+                echo "Smoke test PASSED" >&2
+                cat "$OUTBOX/$ID.json"
+                exit 0
+            else
+                echo "Smoke test FAILED: expected 'OK' in response, got: $RESPONSE_TEXT" >&2
+                cat "$OUTBOX/$ID.json"
+                exit 1
+            fi
+        fi
+
         # Real response — output and exit
         cat "$OUTBOX/$ID.json"
         exit 0
@@ -200,6 +354,7 @@ with open('$OUTBOX/$ID.json', 'w') as f: json.dump(d, f, indent=2)
     # Error response — log and retry
     ERROR=$(python3 -c "import json; print(json.load(open('$OUTBOX/$ID.json')).get('response','unknown'))" 2>/dev/null || echo "unknown")
     echo "Attempt $((attempt+1)) failed: $ERROR" >&2
+    log_exchange "$ID" "error" "$ERROR"
 
     # "In flight" errors are transient — wait and retry without consuming attempt budget
     # Cap at 6 waits (60s total) to avoid infinite loop on a stuck request
@@ -223,9 +378,11 @@ done
 
 # All retries exhausted — output last response if available
 if [[ -f "$OUTBOX/$ID.json" ]]; then
+    log_exchange "$ID" "error" "All retries exhausted"
     cat "$OUTBOX/$ID.json"
     exit 1
 else
+    log_exchange "$ID" "error" "All retries exhausted with no response"
     echo '{"status":"error","response":"All retries exhausted with no response"}'
     exit 1
 fi
