@@ -35,7 +35,7 @@ No network calls. No API keys. Just file-based IPC and the Accessibility API.
 
 ## Features
 
-- **Menu bar app** — no dock icon, runs silently in the background
+- **Menu bar app** — no dock icon, always running silently in the background
 - **File-based IPC** — JSON in/out via `~/.buck/inbox/` and `~/.buck/outbox/`
 - **Smart response detection** — multiple heuristics to know when GPT is done:
   - Text stability across consecutive polls
@@ -269,6 +269,53 @@ These aren't slash commands — they're natural language triggers that Claude Co
 | `--caller NAME` | `$BUCK_CALLER` or none | Caller identifier (e.g. `claude`, `codex`) — sets menu bar icon color |
 | `--retries N` | 2 | Max retries on error |
 
+## BuckSpeak
+
+BuckSpeak is a separate local speak/listen tool for voice-loop testing. It does not use the ChatGPT review path and does not replace `buck-review.sh`.
+
+Current runtime pieces:
+- `buck-speak.sh` — shell wrapper
+- `BuckSpeak.app` — menu bar app runtime (installed to `/Applications/BuckSpeak.app`)
+- `~/.buckspeak/inbox/` + `~/.buckspeak/outbox/` — app-backed IPC between the wrapper and the app
+
+Supported modes:
+
+```bash
+# Speak only
+~/Mac\ Projects/buck/buck-speak.sh --speak --text "Hey ARIA"
+
+# Listen only
+~/Mac\ Projects/buck/buck-speak.sh --listen
+
+# Speak, then listen
+~/Mac\ Projects/buck/buck-speak.sh --speak-listen --text "Hey ARIA"
+```
+
+Important behavior:
+- `buck-speak.sh` auto-launches `BuckSpeak.app` if needed
+- listen mode runs inside the app process so macOS microphone and speech recognition permissions are handled by the app, not the shell wrapper
+- wrapper timeout expands based on `--listen-timeout` so longer listens do not get cut off early
+- default voice is `Lee Premium`, which resolves to the installed macOS voice `Lee (Premium)` when available
+- `--voice NAME` overrides the default voice per call
+
+Example output:
+
+```json
+{
+  "status": "ok",
+  "mode": "speak-listen",
+  "spoken_text": "Hey ARIA",
+  "heard_text": "Hello, how are you?",
+  "speech_started_ms": 4210,
+  "speech_ended_ms": 6840,
+  "duration_ms": 6840,
+  "error": null,
+  "requested_voice": "Lee Premium",
+  "resolved_voice": "Lee (Premium)",
+  "resolved_voice_id": "com.apple.voice.premium.en-AU.Lee"
+}
+```
+
 ## Runtime directories
 
 | Path | Purpose |
@@ -277,6 +324,8 @@ These aren't slash commands — they're natural language triggers that Claude Co
 | `~/.buck/outbox/` | Outgoing review responses (JSON) |
 | `~/.buck/logs/buck.log` | Debug log |
 | `~/.buck/history.db` | SQLite session history (auto-created, 7-day retention) |
+| `~/.buckspeak/inbox/` | Incoming BuckSpeak IPC requests |
+| `~/.buckspeak/outbox/` | Outgoing BuckSpeak IPC responses |
 
 ## Requirements
 

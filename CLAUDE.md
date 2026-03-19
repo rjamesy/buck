@@ -70,6 +70,72 @@ BUCKEOF
 ```
 
 ## Requirements
-- Buck.app must be running (menu bar icon visible)
+- Buck.app is always running as a menu bar app — do NOT launch it before every message
 - ChatGPT desktop app must be open with a visible window
-- If Buck isn't running: `open /Applications/Buck.app`
+- If a `buck-review.sh` call fails with a connection/process error, launch Buck and retry:
+  ```bash
+  open /Applications/Buck.app && sleep 2
+  ```
+
+## BuckSpeak — Voice I/O
+
+BuckSpeak is a separate local speak/listen tool. It does NOT use ChatGPT or `buck-review.sh`. It uses its own app (`BuckSpeak.app`) and IPC directories (`~/.buckspeak/`).
+
+### Modes
+
+```bash
+# Speak only
+"$HOME/Mac Projects/buck/buck-speak.sh" --speak --text "Hello from Claude"
+
+# Listen only (speech recognition)
+"$HOME/Mac Projects/buck/buck-speak.sh" --listen
+
+# Speak, then listen for response
+"$HOME/Mac Projects/buck/buck-speak.sh" --speak-listen --text "Hey ARIA"
+
+# Text from stdin
+echo "Hello" | "$HOME/Mac Projects/buck/buck-speak.sh" --speak --stdin
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--speak` | — | Text-to-speech only |
+| `--listen` | — | Speech recognition only |
+| `--speak-listen` | — | Speak first, then listen |
+| `--text TEXT` | — | Text to speak |
+| `--stdin` | — | Read text from stdin |
+| `--voice NAME` | `Lee Premium` | macOS voice name |
+| `--rate WPM` | system default | Speech rate in words per minute |
+| `--listen-timeout MS` | `20000` | Max listening duration |
+| `--silence-timeout MS` | `2500` | Silence detection cutoff |
+| `--locale ID` | system locale | Speech recognizer locale |
+
+### Output
+
+JSON on stdout:
+```json
+{
+  "status": "ok",
+  "mode": "speak-listen",
+  "spoken_text": "Hey ARIA",
+  "heard_text": "Hello, how are you?",
+  "speech_started_ms": 4210,
+  "speech_ended_ms": 6840,
+  "duration_ms": 6840,
+  "error": null,
+  "requested_voice": "Lee Premium",
+  "resolved_voice": "Lee (Premium)",
+  "resolved_voice_id": "com.apple.voice.premium.en-AU.Lee"
+}
+```
+
+Status is `ok`, `error`, or `timeout`. Exit code 0 = success, 1 = error.
+
+### Reliability notes
+
+- `buck-speak.sh` auto-launches `BuckSpeak.app` if needed — no manual launch required
+- Listen mode runs inside the app process so macOS microphone and speech recognition permissions are handled by the app
+- Bash tool timeout: use `timeout: 60000` (60s) for speak-only, `timeout: 90000` (90s) for listen or speak-listen modes
+- Wrapper timeout scales automatically based on `--listen-timeout`
