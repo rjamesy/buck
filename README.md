@@ -50,6 +50,7 @@ No network calls. No API keys. Just file-based IPC and the Accessibility API.
 - **Session management** — tracks conversations in SQLite, monitors GPT latency, auto-compacts long threads
 - **Incremental summarization** — local Ollama (qwen2.5:3b-instruct) summarizes every turn for context preservation
 - **Auto-compact** — when GPT slows down, signals Claude to refresh the thread with an injected summary
+- **Caller identification** — `--caller` flag tags requests by AI agent; menu bar shows an orange dot for Claude, blue for Codex
 - **Multi-channel** — run parallel Claude Code sessions, each targeting a different ChatGPT window (main vs companion chat)
 - **Detailed logging** — all activity logged to `~/.buck/logs/buck.log`
 
@@ -75,7 +76,7 @@ Buck/Buck/
 | **ChatGPTBridge** | Core engine. Navigates the ChatGPT AX tree (Window → Group → SplitGroup → ChatPane → ScrollArea → List → MessageGroups). Sends messages by setting AXTextArea value and pressing the AXButton with AXHelp "Send message". Polls for response completion using text stability, send button state, and group count heuristics. |
 | **FileWatcher** | Dual-mode file detection: DispatchSource for instant notification, 2-second timer fallback for reliability. Only processes `.json` files; cleans stale `.tmp` on startup. |
 | **ResponseWriter** | Writes response JSON atomically (`.tmp` → `.json` rename). |
-| **Models** | `ReviewRequest` (id, timestamp, type, promptPrefix, content, maxRounds, sessionId) and `ReviewResponse` (id, timestamp, status, response, round). Snake-case JSON coding keys. |
+| **Models** | `ReviewRequest` (id, timestamp, type, promptPrefix, content, maxRounds, sessionId, channel, caller) and `ReviewResponse` (id, timestamp, status, response, round). Snake-case JSON coding keys. |
 | **SessionManager** | Caches incoming requests, records completed request-response pairs in SQLite, triggers async Ollama summarization, checks latency trends, signals when compact is needed. |
 | **ChatHistoryStore** | SQLite (macOS C library, no SPM) with three tables: `claude_sessions` (per-terminal), `gpt_sessions` (per-ChatGPT-thread), `messages`. 7-day retention with auto-cleanup. |
 | **OllamaSummarizer** | HTTP POST to local Ollama (`localhost:11434`). Uses `qwen2.5:3b-instruct` for incremental conversation summarization. Fire-and-forget — never blocks the review loop. |
@@ -138,6 +139,35 @@ alias claude-b='BUCK_CHANNEL=b claude --allow-dangerously-skip-permissions'
 ```
 
 Then run `claude-a` in one terminal and `claude-b` in another — each session's reviews go to a different ChatGPT window.
+
+### Caller identification
+
+When multiple AI agents use Buck simultaneously, the `--caller` flag tags each request so you can see which agent is active at a glance:
+
+| Caller | Menu bar indicator |
+|--------|-------------------|
+| `claude` | Orange dot overlay |
+| `codex` | Blue dot overlay |
+| (none) | Default icon, no dot |
+
+```bash
+# Via flag
+buck-review.sh --caller claude --stdin <<'BUCKEOF'
+content
+BUCKEOF
+
+# Via env var
+BUCK_CALLER=codex buck-review.sh --stdin <<'BUCKEOF'
+content
+BUCKEOF
+```
+
+#### Shell aliases with caller
+
+```bash
+alias claude-a='BUCK_CHANNEL=a BUCK_CALLER=claude claude --allow-dangerously-skip-permissions'
+alias codex-b='BUCK_CHANNEL=b BUCK_CALLER=codex codex'
+```
 
 ### From the command line
 
@@ -236,6 +266,7 @@ These aren't slash commands — they're natural language triggers that Claude Co
 | `--session ID` | — | Session UUID for history tracking and compact |
 | `--timeout N` | 720 | Seconds to wait for response |
 | `--channel X` | `$BUCK_CHANNEL` or none | Target channel (`a` = main window, `b` = companion chat) |
+| `--caller NAME` | `$BUCK_CALLER` or none | Caller identifier (e.g. `claude`, `codex`) — sets menu bar icon color |
 | `--retries N` | 2 | Max retries on error |
 
 ## Runtime directories

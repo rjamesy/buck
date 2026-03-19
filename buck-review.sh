@@ -44,6 +44,7 @@ PROMPT="$DEFAULT_PROMPT"
 CONTENT=""
 SESSION_ID=""
 CHANNEL="${BUCK_CHANNEL:-}"
+CALLER="${BUCK_CALLER:-}"
 SMOKE_TEST=false
 
 while [[ $# -gt 0 ]]; do
@@ -74,6 +75,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --channel)
             CHANNEL="$2"
+            shift 2
+            ;;
+        --caller)
+            CALLER="$2"
             shift 2
             ;;
         --test)
@@ -148,11 +153,12 @@ entry = {
     'request_id': sys.argv[1],
     'prompt': sys.argv[2][:200],
     'content': sys.argv[3][:500],
-    'status': sys.argv[4],
-    'response': sys.argv[5][:1000],
+    'caller': sys.argv[4],
+    'status': sys.argv[5],
+    'response': sys.argv[6][:1000],
 }
 print(json.dumps(entry))
-" "$request_id" "$PROMPT" "$CONTENT" "$status" "$response_text" > "$tmp_log"
+" "$request_id" "$PROMPT" "$CONTENT" "$CALLER" "$status" "$response_text" > "$tmp_log"
 
     cat "$tmp_log" >> "$HISTORY"
     rm -f "$tmp_log"
@@ -215,6 +221,10 @@ while [ $attempt -le $MAX_RETRIES ]; do
     if [[ -n "$CHANNEL" ]]; then
         CHANNEL_FIELD="\"channel\": \"$CHANNEL\","
     fi
+    CALLER_FIELD=""
+    if [[ -n "$CALLER" ]]; then
+        CALLER_FIELD="\"caller\": \"$CALLER\","
+    fi
 
     # Write request (atomic: write tmp then rename)
     cat > "$INBOX/$ID.tmp" << ENDJSON
@@ -224,6 +234,7 @@ while [ $attempt -le $MAX_RETRIES ]; do
   "type": "review_request",
   $SESSION_FIELD
   $CHANNEL_FIELD
+  $CALLER_FIELD
   "prompt_prefix": $PROMPT_ESCAPED,
   "content": $CONTENT_ESCAPED,
   "max_rounds": 1
