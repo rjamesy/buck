@@ -40,6 +40,14 @@ struct BuckApp: App {
             .frame(width: 220)
         } label: {
             Image(systemName: coordinator.menuBarIcon)
+                .overlay(alignment: .topTrailing) {
+                    if coordinator.activeCaller != .none {
+                        Circle()
+                            .fill(coordinator.activeCaller == .claude ? Color.orange : Color.blue)
+                            .frame(width: 6, height: 6)
+                            .offset(x: 2, y: -2)
+                    }
+                }
         }
     }
 }

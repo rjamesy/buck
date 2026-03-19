@@ -6,6 +6,11 @@ class BuckCoordinator: ObservableObject {
     @Published var statusText: String = "Starting..."
     @Published var menuBarIcon: String = "circle"
     @Published var lastRoundInfo: String?
+    @Published var activeCaller: CallerID = .none
+
+    enum CallerID: Equatable {
+        case claude, codex, none
+    }
 
     private var fileWatcher: FileWatcher?
     private let writer = ResponseWriter()
@@ -16,6 +21,7 @@ class BuckCoordinator: ObservableObject {
         let bridge: ChatGPTBridge
         var isProcessing = false
         var activeRequestId: String?
+        var caller: CallerID = .none
     }
 
     private static let channelSubroles: [String: String] = [
@@ -25,6 +31,24 @@ class BuckCoordinator: ObservableObject {
 
     private var channels: [String: ChannelState] = [:]
     private let channelLock = NSLock()
+
+    private static func mapCaller(_ raw: String?) -> CallerID {
+        switch raw?.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "claude": return .claude
+        case "codex": return .codex
+        default: return .none
+        }
+    }
+
+    /// Derive activeCaller from channel state. Must be called while channelLock is held.
+    private func deriveActiveCaller() -> CallerID {
+        for key in channels.keys.sorted() {
+            if channels[key]!.isProcessing && channels[key]!.caller != .none {
+                return channels[key]!.caller
+            }
+        }
+        return .none
+    }
 
     init() {
         // Create a bridge per channel, each targeting a different window subrole
@@ -112,13 +136,19 @@ class BuckCoordinator: ObservableObject {
         }
         channels[channelName]!.isProcessing = true
         channels[channelName]!.activeRequestId = request.id
+        channels[channelName]!.caller = Self.mapCaller(request.caller)
+        let derived = deriveActiveCaller()
         channelLock.unlock()
+        if activeCaller != derived { activeCaller = derived }
 
         defer {
             channelLock.lock()
             channels[channelName]!.isProcessing = false
             channels[channelName]!.activeRequestId = nil
+            channels[channelName]!.caller = .none
+            let derivedAfter = deriveActiveCaller()
             channelLock.unlock()
+            if activeCaller != derivedAfter { activeCaller = derivedAfter }
         }
 
         let bridge = channels[channelName]!.bridge
@@ -221,13 +251,19 @@ class BuckCoordinator: ObservableObject {
         }
         channels[channelName]!.isProcessing = true
         channels[channelName]!.activeRequestId = request.id
+        channels[channelName]!.caller = Self.mapCaller(request.caller)
+        let derived = deriveActiveCaller()
         channelLock.unlock()
+        if activeCaller != derived { activeCaller = derived }
 
         defer {
             channelLock.lock()
             channels[channelName]!.isProcessing = false
             channels[channelName]!.activeRequestId = nil
+            channels[channelName]!.caller = .none
+            let derivedAfter = deriveActiveCaller()
             channelLock.unlock()
+            if activeCaller != derivedAfter { activeCaller = derivedAfter }
         }
 
         let bridge = channels[channelName]!.bridge
