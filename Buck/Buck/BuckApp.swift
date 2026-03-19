@@ -8,7 +8,7 @@ struct BuckApp: App {
     var body: some Scene {
         MenuBarExtra {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Buck")
+                Text((Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String).map { "Buck v\($0)" } ?? "Buck")
                     .font(.headline)
                 Divider()
                 Text(coordinator.statusText)
