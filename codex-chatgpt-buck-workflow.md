@@ -8,7 +8,7 @@ Codex can send prompts to ChatGPT locally through Buck and wait for the JSON rep
 
 ## Prerequisites
 
-1. Buck.app must be running.
+1. Buck.app is always running as a menu bar app — do NOT launch it before every message.
 2. ChatGPT desktop app must be open with a visible window.
 3. Long-running shell commands must be allowed. Use up to 900 seconds if needed.
 
@@ -39,21 +39,15 @@ BUCKEOF
 
 ## Process
 
-1. Ensure Buck is running:
+1. Call `buck-review.sh` with `--prompt` and either `--text` or `--stdin`.
 
-```bash
-pgrep -x Buck >/dev/null || open /Applications/Buck.app
-```
+   If the call fails with a connection/process error, launch Buck and retry:
+   ```bash
+   open /Applications/Buck.app && sleep 2
+   ```
 
-2. Ensure ChatGPT is running:
-
-```bash
-pgrep -x ChatGPT >/dev/null || open -a ChatGPT
-```
-
-3. Call `buck-review.sh` with `--prompt` and either `--text` or `--stdin`.
-4. Wait for JSON on stdout.
-5. Parse the JSON internally — **do NOT show the raw JSON to Richard.**
+2. Wait for JSON on stdout.
+3. Parse the JSON internally — **do NOT show the raw JSON to Richard.**
    Extract and act on:
    - `status` — the decision: `"approved"`, `"feedback"`, or `"error"`
    - `response` — GPT's text (the actual content to read and act on)
@@ -229,11 +223,7 @@ Codex should challenge GPT when it disagrees. Present evidence (exact code, line
 ## Example: Full Edit Review Session
 
 ```bash
-# 1. Ensure apps running
-pgrep -x Buck >/dev/null || open /Applications/Buck.app
-pgrep -x ChatGPT >/dev/null || open -a ChatGPT
-
-# 2. Send plan for approval
+# 1. Send plan for approval
 "$HOME/Mac Projects/buck/buck-review.sh" \
   --prompt "You are reviewing code changes by Codex (OpenAI's coding agent). Be terse. Reply APPROVED if good. Otherwise state exactly what to change." \
   --stdin <<'BUCKEOF'
@@ -246,7 +236,7 @@ Change src/app/api/sitemap.xml/route.ts:
 APPROVED or FEEDBACK?
 BUCKEOF
 
-# 3. If approved, send each edit
+# 2. If approved, send each edit
 "$HOME/Mac Projects/buck/buck-review.sh" \
   --prompt "" \
   --stdin <<'BUCKEOF'
@@ -266,7 +256,7 @@ AFTER:
 APPROVED or FEEDBACK?
 BUCKEOF
 
-# 4. If approved, apply edit and send completion
+# 3. If approved, apply edit and send completion
 "$HOME/Mac Projects/buck/buck-review.sh" \
   --prompt "" \
   --text "All 1/1 edits applied. Done."
