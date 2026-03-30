@@ -24,6 +24,14 @@ func findByDomId(_ el: AXUIElement, _ id: String, depth: Int = 0) -> AXUIElement
     }
     return nil
 }
+func findFirst(_ el: AXUIElement, role: String, depth: Int = 0) -> AXUIElement? {
+    if depth > 25 { return nil }
+    if getString(el, kAXRoleAttribute as String) == role { return el }
+    for child in getChildren(el) {
+        if let f = findFirst(child, role: role, depth: depth + 1) { return f }
+    }
+    return nil
+}
 func findBubbles(_ el: AXUIElement, depth: Int = 0) -> [AXUIElement] {
     if depth > 25 { return [] }
     var results: [AXUIElement] = []
@@ -64,7 +72,6 @@ func freshWindow() -> AXUIElement? {
     guard let ws = getAttr(appEl, kAXWindowsAttribute as String) as? [AXUIElement] else { return nil }
     return ws.first
 }
-
 func postKey(_ vk: CGKeyCode, flags: CGEventFlags? = nil) {
     let src = CGEventSource(stateID: .combinedSessionState)
     let d = CGEvent(keyboardEventSource: src, virtualKey: vk, keyDown: true)
@@ -74,13 +81,11 @@ func postKey(_ vk: CGKeyCode, flags: CGEventFlags? = nil) {
     d?.postToPid(pid)
     u?.postToPid(pid)
 }
-
 func currentBubbleIds() -> Set<String> {
     guard let w = freshWindow(),
           let p = findByDomId(w, "workbench.panel.aichat") else { return [] }
     return Set(findBubbles(p).compactMap { getString($0, "AXDOMIdentifier") })
 }
-
 func lastBubbleText() -> String {
     guard let w = freshWindow(),
           let p = findByDomId(w, "workbench.panel.aichat") else { return "" }
@@ -88,22 +93,34 @@ func lastBubbleText() -> String {
     return collectText(last).trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-func focusChatInput() -> Bool {
+/// Focus the AXTextArea INSIDE the chat panel (not the toolbar container).
+func focusChatTextArea() -> Bool {
     guard let win = freshWindow() else { return false }
+
     if let chatPanel = findByDomId(win, "workbench.panel.aichat") {
-        // Panel open — focus via AX (never Cmd+L which toggles)
-        if let composer = findByDomId(chatPanel, "composer-toolbar-section") {
-            AXUIElementSetAttributeValue(composer, kAXFocusedAttribute as CFString, true as CFTypeRef)
-            AXUIElementPerformAction(composer, kAXPressAction as CFString)
-        } else {
-            AXUIElementSetAttributeValue(chatPanel, kAXFocusedAttribute as CFString, true as CFTypeRef)
+        // Find the actual AXTextArea — the Monaco editor input
+        if let textArea = findFirst(chatPanel, role: kAXTextAreaRole as String) {
+            AXUIElementSetAttributeValue(textArea, kAXFocusedAttribute as CFString, true as CFTypeRef)
+            AXUIElementPerformAction(textArea, kAXPressAction as CFString)
+            print("  focused AXTextArea directly")
+            return true
         }
-        Thread.sleep(forTimeInterval: 0.3)
+        // Fallback: try clicking the chat panel area
+        print("  AXTextArea not found, falling back to panel focus")
+        AXUIElementSetAttributeValue(chatPanel, kAXFocusedAttribute as CFString, true as CFTypeRef)
         return true
     } else {
         // Panel closed — Cmd+L to open
+        print("  panel closed, opening with Cmd+L")
         postKey(0x25, flags: .maskCommand)
         Thread.sleep(forTimeInterval: 1.0)
+        // Now focus the textarea in the newly opened panel
+        if let w2 = freshWindow(), let cp2 = findByDomId(w2, "workbench.panel.aichat"),
+           let ta = findFirst(cp2, role: kAXTextAreaRole as String) {
+            AXUIElementSetAttributeValue(ta, kAXFocusedAttribute as CFString, true as CFTypeRef)
+            AXUIElementPerformAction(ta, kAXPressAction as CFString)
+            print("  focused AXTextArea after Cmd+L")
+        }
         return freshWindow().flatMap { findByDomId($0, "workbench.panel.aichat") } != nil
     }
 }
@@ -118,134 +135,79 @@ func ensurePanelOpen() {
 }
 
 // MARK: - Main
-
 AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, true as CFTypeRef)
 Thread.sleep(forTimeInterval: 0.5)
 print("Connected to Cursor (pid=\(pid))")
 
-let args = CommandLine.arguments.dropFirst()
-if args.isEmpty {
-    print("Usage: test-cursor-bridge [count|read|send <msg>]")
-    exit(0)
-}
-
-if args.first == "count" {
-    guard let w = freshWindow(), let p = findByDomId(w, "workbench.panel.aichat") else {
-        print("Panel not found"); exit(1)
-    }
-    let bubs = findBubbles(p)
-    print("Bubbles: \(bubs.count)")
-    for (i, b) in bubs.enumerated() {
-        let id = getString(b, "AXDOMIdentifier") ?? "?"
-        let t = String(collectText(b).prefix(100)).replacingOccurrences(of: "\n", with: " ")
-        print("  [\(i)] \(id): \(t)")
-    }
-    exit(0)
-}
-
-if args.first == "read" {
-    print(lastBubbleText())
-    exit(0)
-}
-
-// --- SEND ---
-let message = (args.first == "send" ? args.dropFirst() : args).joined(separator: " ")
+let message = CommandLine.arguments.count > 1
+    ? CommandLine.arguments.dropFirst().joined(separator: " ")
+    : "Reply with one word: FIXED"
 print("Sending: \(message)")
 
 app.activate()
 Thread.sleep(forTimeInterval: 0.5)
-guard focusChatInput() else { print("ERROR: cannot focus input"); exit(1) }
+guard focusChatTextArea() else { print("ERROR: cannot focus input"); exit(1) }
+Thread.sleep(forTimeInterval: 0.3)
 
-// Snapshot BEFORE send — this is the baseline for all subsequent checks
 let idsBefore = currentBubbleIds()
 let textBefore = lastBubbleText()
 print("  baseline: \(idsBefore.count) bubbles")
 
-for attempt in 1...3 {
-    if attempt > 1 {
-        print("  retry \(attempt)/3...")
-        app.activate()
-        Thread.sleep(forTimeInterval: 0.3)
-        _ = focusChatInput()
-        Thread.sleep(forTimeInterval: 0.3)
-    }
+// Clear + type
+postKey(0x00, flags: .maskCommand) // Cmd+A
+Thread.sleep(forTimeInterval: 0.1)
+postKey(0x33) // Delete
+Thread.sleep(forTimeInterval: 0.3)
 
-    // Clear + type
-    postKey(0x00, flags: .maskCommand) // Cmd+A
-    Thread.sleep(forTimeInterval: 0.1)
-    postKey(0x33) // Delete
-    Thread.sleep(forTimeInterval: 0.3)
+let src = CGEventSource(stateID: .combinedSessionState)
+for (i, char) in message.unicodeScalars.enumerated() {
+    if i % 100 == 0 && i > 0 { app.activate(); Thread.sleep(forTimeInterval: 0.05) }
+    let d = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true)
+    d?.keyboardSetUnicodeString(stringLength: 1, unicodeString: [UniChar(char.value)])
+    d?.postToPid(pid)
+    let u = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false)
+    u?.postToPid(pid)
+    Thread.sleep(forTimeInterval: 0.01)
+}
+Thread.sleep(forTimeInterval: 0.5)
 
-    let src = CGEventSource(stateID: .combinedSessionState)
-    for (i, char) in message.unicodeScalars.enumerated() {
-        if i % 100 == 0 && i > 0 { app.activate(); Thread.sleep(forTimeInterval: 0.05) }
-        let d = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true)
-        d?.keyboardSetUnicodeString(stringLength: 1, unicodeString: [UniChar(char.value)])
-        d?.postToPid(pid)
-        let u = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false)
-        u?.postToPid(pid)
-        Thread.sleep(forTimeInterval: 0.01)
-    }
+app.activate()
+Thread.sleep(forTimeInterval: 0.1)
+postKey(0x24) // Enter
 
-    Thread.sleep(forTimeInterval: 0.5)
-    app.activate()
-    Thread.sleep(forTimeInterval: 0.1)
-    postKey(0x24) // Enter
+// Verify
+Thread.sleep(forTimeInterval: 3.0)
+ensurePanelOpen()
+Thread.sleep(forTimeInterval: 0.5)
 
-    // Verify — new bubble IDs?
-    Thread.sleep(forTimeInterval: 3.0)
-    ensurePanelOpen()
-    Thread.sleep(forTimeInterval: 0.5)
-
-    let idsAfter = currentBubbleIds()
-    let newIds = idsAfter.subtracting(idsBefore)
-    if !newIds.isEmpty {
-        print("Sent! (\(newIds.count) new)")
-        break
-    }
-    if attempt == 3 { print("ERROR: not delivered after 3 attempts"); exit(1) }
+let idsAfter = currentBubbleIds()
+let newIds = idsAfter.subtracting(idsBefore)
+if !newIds.isEmpty {
+    print("Sent! (\(newIds.count) new)")
+} else {
+    print("ERROR: not delivered (no new bubble IDs)")
+    exit(1)
 }
 
-// --- POLL ---
-// Use idsBefore (pre-send baseline) for response detection.
-// The user's bubble + response bubble are BOTH "new" relative to this.
-// We detect the response by: text of last bubble differs from textBefore.
+// Poll
 print("Polling for response...")
-var lastText = ""
-var stable = 0
-var reopens = 0
-
+var lastText = ""; var stable = 0; var reopens = 0
 for i in 0..<30 {
     Thread.sleep(forTimeInterval: 2.0)
-
     if currentBubbleIds().isEmpty && reopens < 5 {
-        reopens += 1
-        ensurePanelOpen()
-        Thread.sleep(forTimeInterval: 1.0)
+        reopens += 1; ensurePanelOpen(); Thread.sleep(forTimeInterval: 1.0)
     }
-
     let text = lastBubbleText()
     if text.isEmpty || text == textBefore {
-        // Check if new IDs appeared (response might have different text structure)
-        let curIds = currentBubbleIds()
-        let newCount = curIds.subtracting(idsBefore).count
-        print("  [\(i)] waiting... (new=\(newCount))")
+        print("  [\(i)] waiting...")
         continue
     }
-
     if text == lastText {
         stable += 1
-        if stable >= 3 {
-            print("\n--- Response ---")
-            print(text)
-            exit(0)
-        }
+        if stable >= 3 { print("\n--- Response ---"); print(text); exit(0) }
     } else {
-        stable = 0
-        lastText = text
-        print("  [\(i)] streaming (len=\(text.count))")
+        stable = 0; lastText = text; print("  [\(i)] streaming (len=\(text.count))")
     }
 }
-
-print("Timeout. Best: \(lastText.prefix(300))")
+print("Timeout. Best: \(lastText.prefix(200))")
 exit(1)

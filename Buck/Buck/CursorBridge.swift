@@ -292,8 +292,13 @@ final class CursorBridge {
     /// Focus the chat input without toggling the panel.
     ///
     /// Cmd+L TOGGLES the panel (open↔closed). We must NOT use it when
-    /// the panel is already open. Instead, we use AXFocused + AXPress
-    /// on the composer-toolbar-section to focus the input via AX.
+    /// the panel is already open. Instead, we find the AXTextArea
+    /// (the actual Monaco editor input) inside the chat panel and set
+    /// AXFocused directly on it.
+    ///
+    /// Note: composer-toolbar-section is the "9 Files / Undo All / Keep All"
+    /// action bar — NOT the text input. The real input is an AXTextArea
+    /// deeper in the tree (depth ~12).
     ///
     /// If the panel is closed, we use Cmd+L to open it (safe — goes
     /// from closed to open, which always focuses the input).
@@ -301,14 +306,14 @@ final class CursorBridge {
         guard let win = freshWindow() else { return }
 
         if let chatPanel = findByDomId(win, "workbench.panel.aichat") {
-            // Panel is open — focus via AX (never Cmd+L)
-            if let composer = findByDomId(chatPanel, "composer-toolbar-section") {
-                AXUIElementSetAttributeValue(composer, kAXFocusedAttribute as CFString, true as CFTypeRef)
-                AXUIElementPerformAction(composer, kAXPressAction as CFString)
-                log("Focused composer-toolbar via AX")
+            // Panel is open — focus the AXTextArea directly (never Cmd+L)
+            if let textArea = findElement(in: chatPanel, role: kAXTextAreaRole) {
+                AXUIElementSetAttributeValue(textArea, kAXFocusedAttribute as CFString, true as CFTypeRef)
+                AXUIElementPerformAction(textArea, kAXPressAction as CFString)
+                log("Focused AXTextArea directly")
             } else {
                 AXUIElementSetAttributeValue(chatPanel, kAXFocusedAttribute as CFString, true as CFTypeRef)
-                log("Focused chat panel via AX (composer not found)")
+                log("Focused chat panel via AX (AXTextArea not found)")
             }
         } else {
             // Panel is closed — Cmd+L opens it and focuses the input
@@ -316,6 +321,14 @@ final class CursorBridge {
             let src = CGEventSource(stateID: .combinedSessionState)
             postKey(src: src, virtualKey: 0x25, flags: .maskCommand) // Cmd+L
             Thread.sleep(forTimeInterval: 1.0)
+            // Now focus the AXTextArea in the newly opened panel
+            if let w2 = freshWindow(),
+               let cp2 = findByDomId(w2, "workbench.panel.aichat"),
+               let ta = findElement(in: cp2, role: kAXTextAreaRole) {
+                AXUIElementSetAttributeValue(ta, kAXFocusedAttribute as CFString, true as CFTypeRef)
+                AXUIElementPerformAction(ta, kAXPressAction as CFString)
+                log("Focused AXTextArea after Cmd+L open")
+            }
         }
     }
 
