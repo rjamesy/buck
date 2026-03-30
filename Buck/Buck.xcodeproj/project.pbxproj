@@ -16,6 +16,7 @@
 		AA000007 /* ChatHistoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000008; };
 		AA000008 /* OllamaSummarizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000009; };
 		AA000009 /* SessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000010; };
+		AA000011 /* CursorBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000011; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -29,6 +30,7 @@
 		AB000008 /* ChatHistoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatHistoryStore.swift; sourceTree = "<group>"; };
 		AB000009 /* OllamaSummarizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OllamaSummarizer.swift; sourceTree = "<group>"; };
 		AB000010 /* SessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionManager.swift; sourceTree = "<group>"; };
+		AB000011 /* CursorBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CursorBridge.swift; sourceTree = "<group>"; };
 		AC000001 /* Buck.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Buck.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -57,6 +59,7 @@
 				AB000001 /* BuckApp.swift */,
 				AB000002 /* BuckCoordinator.swift */,
 				AB000003 /* ChatGPTBridge.swift */,
+				AB000011 /* CursorBridge.swift */,
 				AB000004 /* FileWatcher.swift */,
 				AB000005 /* ResponseWriter.swift */,
 				AB000006 /* Models.swift */,
@@ -156,6 +159,7 @@
 				AA000007 /* ChatHistoryStore.swift in Sources */,
 				AA000008 /* OllamaSummarizer.swift in Sources */,
 				AA000009 /* SessionManager.swift in Sources */,
+				AA000011 /* CursorBridge.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

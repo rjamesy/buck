@@ -77,6 +77,53 @@ BUCKEOF
   open /Applications/Buck.app && sleep 2
   ```
 
+## CursorBridge — Cursor Chat Injection
+
+CursorBridge sends messages to Cursor's AI chat panel and reads responses via the macOS Accessibility API. It uses keyboard simulation to type (Cursor's Monaco input isn't exposed as an AX text field) and AX tree traversal to read chat bubbles.
+
+### How it works
+
+1. `AXManualAccessibility` forces Chromium to expose the webview DOM as AX elements
+2. Keyboard simulation (CGEvent posted to Cursor's PID): Cmd+L → clear → type → Enter
+3. Chat bubbles live under `domId="workbench.panel.aichat.*"` → `domId="bubble-*"` → AXStaticText
+4. Response completion detected by text stability (3+ consecutive polls with unchanged text)
+
+### Prerequisites
+
+- `~/.cursor/argv.json` must contain `"force-renderer-accessibility": true` (requires Cursor restart)
+- Buck.app must have Accessibility permission in System Settings
+- Cursor must be running with the chat panel open (Cmd+L)
+
+### Testing
+
+```bash
+# Compile the test script (must be compiled — swift interpreter doesn't work for CGEvent)
+swiftc "$HOME/Mac Projects/buck/test-cursor-bridge.swift" -o /tmp/test-cursor-bridge
+
+# Count chat bubbles
+/tmp/test-cursor-bridge count
+
+# Read last response
+/tmp/test-cursor-bridge read
+
+# Send a message and wait for response
+/tmp/test-cursor-bridge send "Your message here"
+```
+
+### Key differences from ChatGPT bridge
+
+| Aspect | ChatGPT | Cursor |
+|--------|---------|--------|
+| Input | AXValue on AXTextArea | CGEvent keyboard simulation |
+| Send | AXPressAction on send button | CGEvent Enter key |
+| Messages | AXList → AXGroup → AXStaticText | `bubble-*` domId → AXStaticText |
+| AX init | `AXUIElementCreateApplication` | + `AXManualAccessibility` per read |
+
+### Source
+
+- `Buck/Buck/CursorBridge.swift` — production bridge (same API shape as ChatGPTBridge)
+- `test-cursor-bridge.swift` — standalone test harness
+
 ## BuckSpeak — Voice I/O
 
 BuckSpeak is a separate local speak/listen tool. It does NOT use ChatGPT or `buck-review.sh`. It uses its own app (`BuckSpeak.app`) and IPC directories (`~/.buckspeak/`).
