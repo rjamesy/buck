@@ -1,10 +1,23 @@
 # Buck
 
-> Let your AI coding agents talk to each other. Claude writes the code, GPT reviews it — automatically.
+> Let your AI coding agents talk to each other — and to any desktop AI app.
 
-A macOS menu bar app that bridges AI coding assistants (Claude Code, Codex, etc.) with the ChatGPT desktop app. Buck automates the copy-paste review loop: your coding agent writes a plan, Buck sends it to ChatGPT via the Accessibility API, ChatGPT reviews it, and Buck pipes the feedback back — all without you touching the keyboard.
+Buck is a macOS toolkit that bridges AI coding assistants (Claude Code, Codex, Cursor, etc.) with desktop AI apps (ChatGPT, Cursor IDE) via the Accessibility API. It automates the copy-paste review loop: your coding agent writes a plan, Buck injects it into the target app, the target reviews it, and Buck pipes the feedback back — all without you touching the keyboard.
+
+## Components
+
+| Component | Type | Purpose |
+|-----------|------|---------|
+| **Buck** | Menu bar app | Core ChatGPT bridge — send/read messages via AX API |
+| **CursorBridge** | Module in Buck | Cursor IDE chat injection — keyboard simulation + AX bubble reading |
+| **Rogers** | Menu bar app | ChatGPT session archiver — polls AX tree, stores in SQLite, summarizes via Ollama |
+| **BuckTeams** | Window app | Multi-AI group chat (User + Claude + Codex + GPT) — partial implementation |
+| **BuckCodex** | Window app | OpenAI Codex UI — direct API client for local Codex sessions |
+| **BuckSpeak** | Menu bar app | Voice I/O — text-to-speech and speech recognition for voice-loop testing |
 
 ## How It Works
+
+### ChatGPT Bridge (original)
 
 ```
 Claude Code / Codex                    Buck (menu bar)                   ChatGPT Desktop
@@ -25,25 +38,54 @@ Claude Code / Codex                    Buck (menu bar)                   ChatGPT
 3. **BuckCoordinator** parses the request and passes the prompt to ChatGPTBridge
 4. **ChatGPTBridge** uses macOS Accessibility API to:
    - Find the ChatGPT window
-   - Set the text in the input field
-   - Press the Send button
+   - Set the text in the input field (AXValue on AXTextArea)
+   - Press the Send button (AXPressAction on AXButton with AXHelp "Send message")
    - Poll for GPT's response (text stability, send button state, message group count)
 5. **ResponseWriter** writes the response JSON to `~/.buck/outbox/`
 6. **buck-review.sh** polls the outbox, reads the response, and outputs it
 
 No network calls. No API keys. Just file-based IPC and the Accessibility API.
 
+### Cursor Bridge (new)
+
+```
+Any process                  test-cursor-bridge              Cursor IDE
+       |                            |                            |
+       |-- runs binary ----------->|                            |
+       |                            |-- AXManualAccessibility -->|  (forces webview AX tree)
+       |                            |-- AXFocus composer ------->|  (no Cmd+L toggle)
+       |                            |-- CGEvent keystrokes ----->|  (type + Enter)
+       |                            |                            |
+       |                            |<-- reads bubble-* domIds --|  (AXStaticText values)
+       |                            |                            |
+       |<-- prints response --------|                            |
+```
+
+Cursor is Electron/Chromium. Its webview doesn't expose content to AX by default. CursorBridge solves this:
+
+1. **AXManualAccessibility** forces Chromium to build an AX tree from the webview DOM
+2. **AX focus** on `composer-toolbar-section` focuses the chat input without toggling the panel (Cmd+L is a toggle — sending it when the panel is open closes it)
+3. **CGEvent.postToPid** types the message character-by-character and presses Enter
+4. **domId tracking** verifies the message was delivered (new `bubble-*` IDs, immune to scroll-induced count changes)
+5. **Text stability polling** on the last bubble detects response completion
+
+Requires `"force-renderer-accessibility": true` in `~/.cursor/argv.json` (one-time setup, Cursor restart needed).
+
 ## Features
 
 - **Menu bar app** — no dock icon, always running silently in the background
+- **Two AI targets** — ChatGPT (AXValue + button press) and Cursor (keyboard simulation + AX bubble reading)
 - **File-based IPC** — JSON in/out via `~/.buck/inbox/` and `~/.buck/outbox/`
 - **Smart response detection** — multiple heuristics to know when GPT is done:
   - Text stability across consecutive polls
-  - Send button disappearance/reappearance
-  - Message group count changes
+  - Send button disappearance/reappearance (ChatGPT)
+  - Message group count changes (ChatGPT)
+  - Bubble domId tracking (Cursor)
   - Tool-use indicator filtering ("Looked at Terminal", etc.)
 - **Automatic retry** — message send retries (3 attempts), shell script retries (configurable)
-- **Concurrency control** — one request at a time, in-flight rejection with graceful retry
+- **Send verification** — confirms message delivery via domId diffing before polling for response
+- **Focus resilience** — periodic re-activation during typing to survive focus contention from other apps
+- **Concurrency control** — one request at a time per channel, in-flight rejection with graceful retry
 - **Atomic file writes** — write to `.tmp`, rename to `.json` (no partial reads)
 - **Structured prompts** — default prompt enforces strict APPROVED/FEEDBACK first-line contract with `<plan>` tag isolation
 - **Truncation handling** — clicks "Show full message", "See more", "Scroll to bottom" automatically
@@ -56,11 +98,14 @@ No network calls. No API keys. Just file-based IPC and the Accessibility API.
 
 ## Architecture
 
+### Buck (Core)
+
 ```
 Buck/Buck/
 ├── BuckApp.swift           SwiftUI menu bar entry point
 ├── BuckCoordinator.swift   Request orchestration, state management, approval detection
-├── ChatGPTBridge.swift     Accessibility API: send messages, read responses, poll for completion
+├── ChatGPTBridge.swift     ChatGPT AX bridge: send messages, read responses, poll for completion
+├── CursorBridge.swift      Cursor AX bridge: keyboard simulation, bubble reading, AX focus
 ├── FileWatcher.swift       DispatchSource + timer fallback watching ~/.buck/inbox/
 ├── ResponseWriter.swift    Atomic JSON writes to ~/.buck/outbox/
 ├── Models.swift            ReviewRequest / ReviewResponse codables
@@ -69,107 +114,65 @@ Buck/Buck/
 └── OllamaSummarizer.swift  Local LLM summarization via Ollama
 ```
 
-| Component | Role |
-|-----------|------|
-| **BuckApp** | SwiftUI `@main`. Renders menu bar icon, status text, and control buttons. |
-| **BuckCoordinator** | Receives inbox files, enforces single-request concurrency, drives the send→wait→write cycle, determines APPROVED vs FEEDBACK. |
-| **ChatGPTBridge** | Core engine. Navigates the ChatGPT AX tree (Window → Group → SplitGroup → ChatPane → ScrollArea → List → MessageGroups). Sends messages by setting AXTextArea value and pressing the AXButton with AXHelp "Send message". Polls for response completion using text stability, send button state, and group count heuristics. |
-| **FileWatcher** | Dual-mode file detection: DispatchSource for instant notification, 2-second timer fallback for reliability. Only processes `.json` files; cleans stale `.tmp` on startup. |
-| **ResponseWriter** | Writes response JSON atomically (`.tmp` → `.json` rename). |
-| **Models** | `ReviewRequest` (id, timestamp, type, promptPrefix, content, maxRounds, sessionId, channel, caller) and `ReviewResponse` (id, timestamp, status, response, round). Snake-case JSON coding keys. |
-| **SessionManager** | Caches incoming requests, records completed request-response pairs in SQLite, triggers async Ollama summarization, checks latency trends, signals when compact is needed. |
-| **ChatHistoryStore** | SQLite (macOS C library, no SPM) with three tables: `claude_sessions` (per-terminal), `gpt_sessions` (per-ChatGPT-thread), `messages`. 7-day retention with auto-cleanup. |
-| **OllamaSummarizer** | HTTP POST to local Ollama (`localhost:11434`). Uses `qwen2.5:3b-instruct` for incremental conversation summarization. Fire-and-forget — never blocks the review loop. |
+### Other Components
 
-### AX Tree Path
+```
+Rogers/                     ChatGPT session archiver — polls AX, stores in SQLite, summarizes
+BuckTeams/                  Multi-AI group chat (User + Claude + Codex + GPT) — partial
+BuckCodex/                  OpenAI Codex UI — direct API client
+BuckSpeak/                  Voice I/O — TTS and speech recognition
+BuckSpeakV3/                Voice I/O for Teams context
+```
 
+### Shell Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `buck-review.sh` | CLI for sending reviews to ChatGPT via Buck |
+| `buck-speak.sh` | CLI for voice I/O via BuckSpeak |
+| `buck-teams.sh` | CLI for multi-AI group chat via BuckTeams |
+| `buck-exec.sh` | CLI for autonomous code execution via Buck |
+| `test-cursor-bridge.swift` | Test harness for CursorBridge (must be compiled) |
+
+### AX Tree Paths
+
+**ChatGPT:**
 ```
 ChatGPT Window
 └── AXGroup
     └── AXSplitGroup
         └── AXGroup (chat pane — most children)
             └── AXScrollArea
-                └── AXList
-                    └── AXList
-                        └── AXGroup (message groups)
-                            └── AXGroup
-                                └── AXStaticText (AXValue or AXDescription)
+                └── AXList → AXList → AXGroup (message groups)
+                    └── AXGroup → AXStaticText (AXValue or AXDescription)
+```
+
+**Cursor:**
+```
+Cursor Window
+└── AXGroup → AXWebArea → AXGroup (AXWebApplication)
+    └── AXGroup (domId="workbench.panel.aichat.*")
+        └── AXGroup (domId="bubble-*")         ← chat messages
+            └── AXStaticText (AXValue)
+        └── AXGroup (domId="composer-toolbar-section")  ← input area
 ```
 
 ### Response Detection
 
-The hardest problem Buck solves: knowing when GPT is done generating. It uses three independent signals:
+The hardest problem Buck solves: knowing when the AI is done generating. It uses three independent signals:
 
+**ChatGPT:**
 1. **Text stability** — response text unchanged for 3–4 consecutive polls (2s interval)
 2. **Send button cycle** — button disappears (generation active) then reappears for 2 consecutive polls
-3. **Identical response with new groups** — handles repeated responses (e.g. "APPROVED" twice) by checking message group count increased
+3. **Identical response with new groups** — handles repeated responses by checking message group count
+
+**Cursor:**
+1. **Text stability** — last bubble text unchanged for 3–4 consecutive polls
+2. **domId diffing** — new bubble IDs appearing relative to pre-send baseline
 
 ## Usage
 
-### Multi-channel
-
-Buck supports independent channels so multiple Claude Code sessions can each talk to their own ChatGPT window simultaneously:
-
-| Channel | ChatGPT window | AX subrole |
-|---------|---------------|------------|
-| `a` (default) | Main window | `AXStandardWindow` |
-| `b` | Companion chat | `AXSystemDialog` |
-
-Set the channel via the `BUCK_CHANNEL` environment variable or the `--channel` flag:
-
-```bash
-# Via env var
-BUCK_CHANNEL=b buck-review.sh --stdin <<'BUCKEOF'
-content
-BUCKEOF
-
-# Via flag
-buck-review.sh --channel b --stdin <<'BUCKEOF'
-content
-BUCKEOF
-```
-
-#### Shell aliases for multi-channel Claude Code
-
-Add these to `~/.zshrc` to launch Claude Code sessions pre-configured for a specific channel:
-
-```bash
-alias claude-a='BUCK_CHANNEL=a claude --allow-dangerously-skip-permissions'
-alias claude-b='BUCK_CHANNEL=b claude --allow-dangerously-skip-permissions'
-```
-
-Then run `claude-a` in one terminal and `claude-b` in another — each session's reviews go to a different ChatGPT window.
-
-### Caller identification
-
-When multiple AI agents use Buck simultaneously, the `--caller` flag tags each request so you can see which agent is active at a glance:
-
-| Caller | Menu bar indicator |
-|--------|-------------------|
-| `claude` | Orange dot overlay |
-| `codex` | Blue dot overlay |
-| (none) | Default icon, no dot |
-
-```bash
-# Via flag
-buck-review.sh --caller claude --stdin <<'BUCKEOF'
-content
-BUCKEOF
-
-# Via env var
-BUCK_CALLER=codex buck-review.sh --stdin <<'BUCKEOF'
-content
-BUCKEOF
-```
-
-#### Shell aliases with caller
-
-```bash
-alias claude-a='BUCK_CHANNEL=a BUCK_CALLER=claude claude --allow-dangerously-skip-permissions'
-alias codex-b='BUCK_CHANNEL=b BUCK_CALLER=codex codex'
-```
-
-### From the command line
+### ChatGPT Review (buck-review.sh)
 
 ```bash
 # Review a file
@@ -200,63 +203,28 @@ Output is JSON:
 
 Status is one of: `approved`, `feedback`, `error`.
 
-### Integrating with Claude Code
-
-Buck uses two separate CLAUDE.md files with different purposes:
-
-| File | Location | Purpose |
-|------|----------|---------|
-| **Project CLAUDE.md** | `<project-root>/CLAUDE.md` | Teaches Claude Code how to call `buck-review.sh` — syntax, JSON format, retry rules. Loaded when working in that project. |
-| **Global CLAUDE.md** | `~/.claude/CLAUDE.md` | Tells Claude Code to **automatically** use Buck as a reviewer for every plan and every edit — the full auto-review workflow. Loaded in all projects. |
-
-The project file is already included in this repo. The global file you need to create yourself.
-
-#### 1. Project-level `CLAUDE.md` (already included)
-
-The [CLAUDE.md](CLAUDE.md) in this repo tells Claude Code how to call `buck-review.sh`, interpret JSON responses, and handle retries. It's loaded automatically when Claude Code works in this project directory.
-
-For **other projects** that should use Buck for reviews, copy `CLAUDE.md` into that project's root, or symlink it.
-
-#### 2. Global `~/.claude/CLAUDE.md` (you must add this)
-
-To make Claude Code use Buck as an **automatic reviewer for all projects** — where GPT reviews every plan and every edit before it's applied — copy the example file into your Claude Code config:
+### Cursor Chat Injection (test-cursor-bridge)
 
 ```bash
-# If you don't have a global CLAUDE.md yet:
-cp examples/global-claude-md.md ~/.claude/CLAUDE.md
+# Compile once (must be compiled — swift interpreter drops CGEvents)
+swiftc "$HOME/Mac Projects/buck/test-cursor-bridge.swift" -o /tmp/test-cursor-bridge
 
-# If you already have one, append it:
-cat examples/global-claude-md.md >> ~/.claude/CLAUDE.md
+# Count chat bubbles
+/tmp/test-cursor-bridge count
+
+# Read last response
+/tmp/test-cursor-bridge read
+
+# Send a message and wait for response
+/tmp/test-cursor-bridge send "Your message here"
 ```
 
-The full content is in [`examples/global-claude-md.md`](examples/global-claude-md.md). It configures three modes:
+Prerequisites:
+- `~/.cursor/argv.json` must contain `"force-renderer-accessibility": true` (requires Cursor restart)
+- The binary (or Buck.app) must have Accessibility permission
+- Cursor must be running with the chat panel open
 
-- **Chat mode** — AI-to-AI discussion between Claude and GPT ("chat with gpt about X")
-- **Review mode** — send a plan to GPT for approval ("send to buck")
-- **Auto edit review** (default) — GPT automatically reviews every plan and every code edit before Claude applies it. No user confirmation needed.
-
-> **Path note:** The example file uses `$HOME/Mac Projects/buck/buck-review.sh`. If you cloned Buck to a different location, update the path in both your global `~/.claude/CLAUDE.md` and any project-level `CLAUDE.md` files.
-
-#### 3. For OpenAI Codex / other agents
-
-See [AGENTS.md](AGENTS.md) for the equivalent instructions targeting Codex. Same path note applies.
-
-### Suggested commands in Claude Code
-
-Once configured, these natural-language commands trigger Buck workflows:
-
-| Command | What happens |
-|---------|-------------|
-| **"send to buck"** / **"get GPT review"** | Sends the current plan to GPT for approval. Returns APPROVED or FEEDBACK. |
-| **"chat with gpt about X"** / **"discuss X with gpt"** | Opens an AI-to-AI discussion. Claude and GPT go back and forth, then summarise the agreed approach. |
-| **"ask gpt about X"** | Single-shot question to GPT. Claude sends the question, reads the answer, reports back. |
-| **"challenge gpt on this"** | Claude sends GPT a skeptical review prompt — "try to break this plan" — then reports GPT's critique. |
-| **"plan with gpt"** | Claude and GPT collaborate on a plan. They iterate until converging, then present the result. |
-| **"gpt is supervisor"** | Default auto-review mode. GPT reviews every plan and every edit before Claude applies it. No user confirmation. |
-
-These aren't slash commands — they're natural language triggers that Claude Code recognises from the global CLAUDE.md instructions.
-
-### Script options
+### Script Options (buck-review.sh)
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -269,16 +237,50 @@ These aren't slash commands — they're natural language triggers that Claude Co
 | `--caller NAME` | `$BUCK_CALLER` or none | Caller identifier (e.g. `claude`, `codex`) — sets menu bar icon color |
 | `--retries N` | 2 | Max retries on error |
 
-## BuckSpeak
+### Multi-channel
 
-BuckSpeak is a separate local speak/listen tool for voice-loop testing. It does not use the ChatGPT review path and does not replace `buck-review.sh`.
+Buck supports independent channels so multiple Claude Code sessions can each talk to their own ChatGPT window:
 
-Current runtime pieces:
-- `buck-speak.sh` — shell wrapper
-- `BuckSpeak.app` — menu bar app runtime (installed to `/Applications/BuckSpeak.app`)
-- `~/.buckspeak/inbox/` + `~/.buckspeak/outbox/` — app-backed IPC between the wrapper and the app
+| Channel | ChatGPT window | AX subrole |
+|---------|---------------|------------|
+| `a` (default) | Main window | `AXStandardWindow` |
+| `b` | Companion chat | `AXSystemDialog` |
 
-Supported modes:
+```bash
+# Via env var
+BUCK_CHANNEL=b buck-review.sh --stdin <<'BUCKEOF'
+content
+BUCKEOF
+
+# Via flag
+buck-review.sh --channel b --stdin <<'BUCKEOF'
+content
+BUCKEOF
+```
+
+Shell aliases for multi-channel Claude Code:
+```bash
+alias claude-a='BUCK_CHANNEL=a BUCK_CALLER=claude claude --allow-dangerously-skip-permissions'
+alias claude-b='BUCK_CHANNEL=b BUCK_CALLER=codex claude --allow-dangerously-skip-permissions'
+```
+
+### Caller identification
+
+| Caller | Menu bar indicator |
+|--------|-------------------|
+| `claude` | Orange dot overlay |
+| `codex` | Blue dot overlay |
+| (none) | Default icon, no dot |
+
+```bash
+buck-review.sh --caller claude --stdin <<'BUCKEOF'
+content
+BUCKEOF
+```
+
+## BuckSpeak — Voice I/O
+
+BuckSpeak is a separate local speak/listen tool for voice-loop testing. It does not use the ChatGPT review path.
 
 ```bash
 # Speak only
@@ -291,53 +293,97 @@ Supported modes:
 ~/Mac\ Projects/buck/buck-speak.sh --speak-listen --text "Hey ARIA"
 ```
 
-Important behavior:
-- `buck-speak.sh` auto-launches `BuckSpeak.app` if needed
-- listen mode runs inside the app process so macOS microphone and speech recognition permissions are handled by the app, not the shell wrapper
-- wrapper timeout expands based on `--listen-timeout` so longer listens do not get cut off early
-- default voice is `Lee Premium`, which resolves to the installed macOS voice `Lee (Premium)` when available
-- `--voice NAME` overrides the default voice per call
+- Auto-launches `BuckSpeak.app` if needed
+- Listen mode runs inside the app process (handles macOS microphone/speech permissions)
+- Default voice: `Lee Premium`
+- Output: JSON with `status`, `spoken_text`, `heard_text`, timing fields
 
-Example output:
+## Rogers — Session Archiver
 
-```json
-{
-  "status": "ok",
-  "mode": "speak-listen",
-  "spoken_text": "Hey ARIA",
-  "heard_text": "Hello, how are you?",
-  "speech_started_ms": 4210,
-  "speech_ended_ms": 6840,
-  "duration_ms": 6840,
-  "error": null,
-  "requested_voice": "Lee Premium",
-  "resolved_voice": "Lee (Premium)",
-  "resolved_voice_id": "com.apple.voice.premium.en-AU.Lee"
-}
+Rogers is a menu bar app that monitors ChatGPT conversations via the AX API and archives them:
+
+- Polls the ChatGPT AX tree to detect new sessions and messages
+- Stores sessions and messages in SQLite with fingerprint-based deduplication
+- Summarizes conversations locally via Ollama (qwen2.5)
+- Provides a window UI for browsing archived sessions
+
+## BuckTeams — Multi-AI Group Chat (Partial)
+
+BuckTeams coordinates a 4-way group chat between User, Claude, Codex, and GPT:
+
+- 3-column UI: participants, chat, decisions
+- Message routing: CLI agents via file IPC, GPT via AX bridge, user via UI
+- `~/.buckteams/chat.jsonl` as single source of truth (NDJSON append-only)
+- Consensus detection for decisions (≥2 agents agree or user confirms)
+- `buck-teams.sh` CLI interface
+
+Status: Core coordinator, chat log, participant tracking, and decision store implemented. UI views need full integration.
+
+## Integrating with Claude Code
+
+Buck uses two CLAUDE.md files:
+
+| File | Location | Purpose |
+|------|----------|---------|
+| **Project CLAUDE.md** | `<project-root>/CLAUDE.md` | Teaches Claude how to call `buck-review.sh` and `test-cursor-bridge` |
+| **Global CLAUDE.md** | `~/.claude/CLAUDE.md` | Auto-review workflow — GPT reviews every plan and edit automatically |
+
+The project file is included in this repo. For the global file:
+
+```bash
+# If you don't have a global CLAUDE.md yet:
+cp examples/global-claude-md.md ~/.claude/CLAUDE.md
+
+# If you already have one, append it:
+cat examples/global-claude-md.md >> ~/.claude/CLAUDE.md
 ```
 
-## Runtime directories
+For Codex, see [AGENTS.md](AGENTS.md).
+
+### Suggested commands in Claude Code
+
+| Command | What happens |
+|---------|-------------|
+| **"send to buck"** / **"get GPT review"** | Sends the current plan to GPT for approval |
+| **"chat with gpt about X"** | AI-to-AI discussion between Claude and GPT |
+| **"ask gpt about X"** | Single-shot question to GPT |
+| **"challenge gpt on this"** | Skeptical review — GPT tries to break the plan |
+| **"say hello to cursor"** | Sends a message to Cursor's chat via CursorBridge |
+
+These are natural language triggers from the global CLAUDE.md instructions, not slash commands.
+
+## Runtime Directories
 
 | Path | Purpose |
 |------|---------|
 | `~/.buck/inbox/` | Incoming review requests (JSON) |
 | `~/.buck/outbox/` | Outgoing review responses (JSON) |
-| `~/.buck/logs/buck.log` | Debug log |
-| `~/.buck/history.db` | SQLite session history (auto-created, 7-day retention) |
-| `~/.buckspeak/inbox/` | Incoming BuckSpeak IPC requests |
-| `~/.buckspeak/outbox/` | Outgoing BuckSpeak IPC responses |
+| `~/.buck/logs/buck.log` | Debug log (Buck + CursorBridge) |
+| `~/.buck/history.db` | SQLite session history (7-day retention) |
+| `~/.buckspeak/inbox/` | BuckSpeak IPC requests |
+| `~/.buckspeak/outbox/` | BuckSpeak IPC responses |
+| `~/.buckteams/chat.jsonl` | BuckTeams chat log (NDJSON) |
+| `~/.buckteams/staging/` | BuckTeams agent message submissions |
+| `~/.buckteams/participants/` | BuckTeams presence/status files |
 
 ## Requirements
 
 - macOS 14.0+
 - Xcode 15+ (to build)
-- ChatGPT desktop app (installed and open with a visible window)
-- Accessibility permission granted to Buck
+- ChatGPT desktop app (for ChatGPT bridge)
+- Cursor IDE (for Cursor bridge) with `force-renderer-accessibility: true` in `~/.cursor/argv.json`
+- Accessibility permission granted to Buck (and/or compiled test binaries)
 - Ollama with `qwen2.5:3b-instruct` model (optional — for session summarization)
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). PRs welcome — especially for response detection improvements, AX tree resilience, and new AI target support.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for code style, testing, and PR guidelines. High-impact areas:
+
+- Response detection improvements
+- AX tree resilience (both ChatGPT and Cursor)
+- New AI target support (Gemini, Claude desktop, local models)
+- BuckTeams UI integration
+- Pre-built releases
 
 ## License
 
