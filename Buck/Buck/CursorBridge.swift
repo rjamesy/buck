@@ -66,6 +66,7 @@ final class CursorBridge {
         let idsBefore = currentBubbleIds()
         preSendBubbleIds = idsBefore
         preSendLastText = (try? readLastResponse()) ?? ""
+        sentMessageText = text
 
         for attempt in 1...3 {
             log("Send attempt \(attempt)/3 (bubble IDs before: \(idsBefore.count))")
@@ -176,6 +177,9 @@ final class CursorBridge {
     /// This avoids a race where the response appears between send and poll start.
     private var preSendBubbleIds: Set<String> = []
     private var preSendLastText: String = ""
+    /// The message text we sent, used to detect and skip Cursor's echo bubble.
+    /// Cursor echoes the user's message while "thinking" before producing the real response.
+    private var sentMessageText: String = ""
 
     func waitForResponse(timeout: TimeInterval = 120) async throws -> String {
         guard appElement != nil else {
@@ -186,8 +190,10 @@ final class CursorBridge {
         // otherwise take a fresh snapshot now.
         let initialText = preSendLastText.isEmpty ? ((try? readLastResponse()) ?? "") : preSendLastText
         let initialIds = preSendBubbleIds.isEmpty ? currentBubbleIds() : preSendBubbleIds
+        let echoText = sentMessageText
         preSendBubbleIds = []
         preSendLastText = ""
+        sentMessageText = ""
         let deadline = Date().addingTimeInterval(timeout)
         var peakLength = 0
         var bestText = ""
@@ -231,6 +237,15 @@ final class CursorBridge {
 
             if trimmed.isEmpty { stableCount = 0; continue }
             if currentText == initialText { continue }
+
+            // Skip Cursor's echo bubble — Cursor echoes the sent message while
+            // "thinking" before producing the real response. Check if the last
+            // bubble text is a substring of (or matches) what we sent.
+            if !echoText.isEmpty && isEcho(trimmed, of: echoText) {
+                log("poll: skipping echo bubble (len=\(currentLen))")
+                stableCount = 0
+                continue
+            }
 
             if currentLen >= peakLength {
                 peakLength = currentLen
@@ -285,6 +300,34 @@ final class CursorBridge {
         }
 
         log("startNewChat: button not found")
+    }
+
+    // MARK: - Echo Detection
+
+    /// Check if the bubble text is just Cursor echoing the sent message.
+    /// Cursor may echo the full message, a truncated prefix, or add minor
+    /// formatting. We check both directions: bubble contains sent text,
+    /// or sent text contains bubble text.
+    private func isEcho(_ bubbleText: String, of sentText: String) -> Bool {
+        let bubble = bubbleText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sent = sentText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bubble.isEmpty && !sent.isEmpty else { return false }
+
+        // Exact match
+        if bubble == sent { return true }
+
+        // Bubble is a prefix/substring of the sent message (truncated echo)
+        if sent.contains(bubble) && bubble.count > 20 { return true }
+
+        // Sent message is contained in the bubble (echo with minor additions)
+        if bubble.contains(sent) { return true }
+
+        // Fuzzy: first 50 chars match (handles minor formatting differences)
+        let bubblePrefix = String(bubble.prefix(50))
+        let sentPrefix = String(sent.prefix(50))
+        if bubblePrefix == sentPrefix && bubblePrefix.count >= 20 { return true }
+
+        return false
     }
 
     // MARK: - Focus Chat Input

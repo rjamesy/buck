@@ -189,6 +189,18 @@ if !newIds.isEmpty {
     exit(1)
 }
 
+// Echo detection — Cursor echoes the sent message while "thinking"
+func isEcho(_ bubbleText: String, of sentText: String) -> Bool {
+    let b = bubbleText.trimmingCharacters(in: .whitespacesAndNewlines)
+    let s = sentText.trimmingCharacters(in: .whitespacesAndNewlines)
+    if b.isEmpty || s.isEmpty { return false }
+    if b == s { return true }
+    if s.contains(b) && b.count > 20 { return true }
+    if b.contains(s) { return true }
+    if String(b.prefix(50)) == String(s.prefix(50)) && b.count >= 20 { return true }
+    return false
+}
+
 // Poll
 print("Polling for response...")
 var lastText = ""; var stable = 0; var reopens = 0
@@ -200,6 +212,12 @@ for i in 0..<30 {
     let text = lastBubbleText()
     if text.isEmpty || text == textBefore {
         print("  [\(i)] waiting...")
+        continue
+    }
+    // Skip Cursor's echo of the sent message
+    if isEcho(text, of: message) {
+        print("  [\(i)] echo (skipping)")
+        stable = 0
         continue
     }
     if text == lastText {
