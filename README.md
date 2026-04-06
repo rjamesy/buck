@@ -12,7 +12,7 @@ Buck is a macOS toolkit that bridges AI coding assistants (Claude Code, Codex, C
 | **CursorBridge** | Module in Buck | Cursor IDE chat injection — keyboard simulation + AX bubble reading |
 | **CodexBridge** | Module in Buck | OpenAI Responses API — direct HTTP calls, no desktop app needed |
 | **Rogers** | Menu bar app | ChatGPT session archiver — polls AX tree, stores in SQLite, summarizes via Ollama |
-| **BuckTeams** | Window app | Multi-AI group chat (User + Claude + Codex + GPT) — partial implementation |
+| **BuckTeams** | Window app | Multi-AI group chat — GPT + Codex via OpenAI API, Claude via file IPC |
 | **BuckCodex** | Window app | OpenAI Codex UI — direct API client for local Codex sessions |
 | **BuckSpeak** | Menu bar app | Voice I/O — text-to-speech and speech recognition for voice-loop testing |
 
@@ -159,7 +159,7 @@ BuckSpeakV3/                Voice I/O for Teams context
 |--------|---------|
 | `buck-review.sh` | CLI for sending reviews to ChatGPT, Cursor, or Codex via Buck |
 | `buck-speak.sh` | CLI for voice I/O via BuckSpeak |
-| `buck-teams.sh` | CLI for multi-AI group chat via BuckTeams |
+| `buck-teams.sh` | CLI for multi-AI group chat via BuckTeams (join, send, poll, listen) |
 | `buck-exec.sh` | CLI for autonomous code execution via Buck |
 | `test-cursor-bridge.swift` | Test harness for CursorBridge (must be compiled) |
 
@@ -343,17 +343,36 @@ Rogers is a menu bar app that monitors ChatGPT conversations via the AX API and 
 - Summarizes conversations locally via Ollama (qwen2.5)
 - Provides a window UI for browsing archived sessions
 
-## BuckTeams — Multi-AI Group Chat (Partial)
+## BuckTeams — Multi-AI Group Chat
 
 BuckTeams coordinates a 4-way group chat between User, Claude, Codex, and GPT:
 
-- 3-column UI: participants, chat, decisions
-- Message routing: CLI agents via file IPC, GPT via AX bridge, user via UI
+- 3-column UI: participants sidebar, chat, decisions panel
+- **GPT** (`gpt-5.4-mini`) and **Codex** (`gpt-5.3-codex`) use direct OpenAI API bridges (stateful via `previous_response_id`) — no ChatGPT desktop app needed
+- **Claude** participates via `buck-teams.sh` CLI (file IPC) with event-driven `--listen` mode (fswatch)
+- Bridge responses don't trigger other bridges (no GPT↔Codex ping-pong loops)
+- Each bridge gets its own identity prompt ("You are GPT" / "You are Codex")
 - `~/.buckteams/chat.jsonl` as single source of truth (NDJSON append-only)
 - Consensus detection for decisions (≥2 agents agree or user confirms)
-- `buck-teams.sh` CLI interface
+- Claude Code hook (`UserPromptSubmit`) auto-polls for new messages on every user interaction
 
-Status: Core coordinator, chat log, participant tracking, and decision store implemented. UI views need full integration.
+### Claude Code Integration
+
+```bash
+# Join a session
+buck-teams.sh --join --agent claude
+
+# Send a message
+buck-teams.sh --send "message" --agent claude
+
+# Poll for new messages (non-blocking)
+buck-teams.sh --poll --agent claude
+
+# Event-driven listener (for terminal, not Claude Code)
+buck-teams.sh --listen --agent claude
+```
+
+Config: `~/.buckteams/codex-config.json` (API key shared by both GPT and Codex bridges).
 
 ## Integrating with Claude Code
 
@@ -402,6 +421,8 @@ These are natural language triggers from the global CLAUDE.md instructions, not 
 | `~/.buckteams/chat.jsonl` | BuckTeams chat log (NDJSON) |
 | `~/.buckteams/staging/` | BuckTeams agent message submissions |
 | `~/.buckteams/participants/` | BuckTeams presence/status files |
+| `~/.buckteams/codex-config.json` | BuckTeams API key for GPT + Codex bridges |
+| `~/.buckteams/inbox/` | BuckTeams ping files for agent wake signals |
 
 ## Requirements
 

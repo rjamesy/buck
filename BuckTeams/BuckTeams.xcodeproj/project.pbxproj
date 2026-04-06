@@ -1,0 +1,328 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		AA100001 /* BuckTeamsApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100001; };
+		AA100002 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100002; };
+		AA100003 /* ChatLogStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100003; };
+		AA100004 /* ChatGPTBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100004; };
+		AA100005 /* TeamsCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100005; };
+		AA100006 /* ParticipantManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100006; };
+		AA100007 /* GPTResponseParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100007; };
+		AA100008 /* StagingWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100008; };
+		AA100009 /* DecisionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100009; };
+		AA100010 /* SessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100010; };
+		AA100011 /* SidebarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100011; };
+		AA100012 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100012; };
+		AA100013 /* DecisionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100013; };
+		AA100014 /* BridgeProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100015; };
+		AA100015 /* CodexBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100016; };
+		AA100016 /* CursorBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB100017; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		AB100001 /* BuckTeamsApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuckTeamsApp.swift; sourceTree = "<group>"; };
+		AB100002 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		AB100003 /* ChatLogStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatLogStore.swift; sourceTree = "<group>"; };
+		AB100004 /* ChatGPTBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatGPTBridge.swift; sourceTree = "<group>"; };
+		AB100005 /* TeamsCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamsCoordinator.swift; sourceTree = "<group>"; };
+		AB100006 /* ParticipantManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParticipantManager.swift; sourceTree = "<group>"; };
+		AB100007 /* GPTResponseParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GPTResponseParser.swift; sourceTree = "<group>"; };
+		AB100008 /* StagingWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StagingWatcher.swift; sourceTree = "<group>"; };
+		AB100009 /* DecisionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DecisionStore.swift; sourceTree = "<group>"; };
+		AB100010 /* SessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionManager.swift; sourceTree = "<group>"; };
+		AB100011 /* SidebarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarView.swift; sourceTree = "<group>"; };
+		AB100012 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		AB100013 /* DecisionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DecisionsView.swift; sourceTree = "<group>"; };
+		AB100014 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		AB100015 /* BridgeProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeProtocol.swift; sourceTree = "<group>"; };
+		AB100016 /* CodexBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexBridge.swift; sourceTree = "<group>"; };
+		AB100017 /* CursorBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CursorBridge.swift; sourceTree = "<group>"; };
+		AC100001 /* BuckTeams.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BuckTeams.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		AD100001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		AE100001 = {
+			isa = PBXGroup;
+			children = (
+				AE100002 /* BuckTeams */,
+				AE100003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		AE100002 /* BuckTeams */ = {
+			isa = PBXGroup;
+			children = (
+				AB100001 /* BuckTeamsApp.swift */,
+				AB100002 /* Models.swift */,
+				AB100003 /* ChatLogStore.swift */,
+				AB100015 /* BridgeProtocol.swift */,
+				AB100004 /* ChatGPTBridge.swift */,
+				AB100016 /* CodexBridge.swift */,
+				AB100017 /* CursorBridge.swift */,
+				AB100005 /* TeamsCoordinator.swift */,
+				AB100006 /* ParticipantManager.swift */,
+				AB100007 /* GPTResponseParser.swift */,
+				AB100008 /* StagingWatcher.swift */,
+				AB100009 /* DecisionStore.swift */,
+				AB100010 /* SessionManager.swift */,
+				AB100011 /* SidebarView.swift */,
+				AB100012 /* ChatView.swift */,
+				AB100013 /* DecisionsView.swift */,
+				AB100014 /* Info.plist */,
+			);
+			path = BuckTeams;
+			sourceTree = "<group>";
+		};
+		AE100003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				AC100001 /* BuckTeams.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		AX100001 /* Deploy to Applications */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Deploy to Applications";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "# Copy to /Applications so AX permission persists across rebuilds\nif [ -d /Applications/BuckTeams.app ]; then\n    rm -rf /Applications/BuckTeams.app\nfi\ncp -R \"${BUILT_PRODUCTS_DIR}/BuckTeams.app\" /Applications/BuckTeams.app\n# Ad-hoc sign so macOS will launch it\ncodesign --force --sign - --deep --preserve-metadata=entitlements /Applications/BuckTeams.app\nxattr -cr /Applications/BuckTeams.app\necho \"Deployed BuckTeams.app to /Applications (ad-hoc signed)\"\n";
+		};
+		AF100001 /* BuckTeams */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B1100001 /* Build configuration list for PBXNativeTarget "BuckTeams" */;
+			buildPhases = (
+				AG100001 /* Sources */,
+				AD100001 /* Frameworks */,
+				AX100001 /* Deploy to Applications */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = BuckTeams;
+			productName = BuckTeams;
+			productReference = AC100001 /* BuckTeams.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AH100001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+			};
+			buildConfigurationList = B1100002 /* Build configuration list for PBXProject "BuckTeams" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = AE100001;
+			productRefGroup = AE100003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				AF100001 /* BuckTeams */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		AG100001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA100001 /* BuckTeamsApp.swift in Sources */,
+				AA100002 /* Models.swift in Sources */,
+				AA100003 /* ChatLogStore.swift in Sources */,
+				AA100004 /* ChatGPTBridge.swift in Sources */,
+				AA100005 /* TeamsCoordinator.swift in Sources */,
+				AA100006 /* ParticipantManager.swift in Sources */,
+				AA100007 /* GPTResponseParser.swift in Sources */,
+				AA100008 /* StagingWatcher.swift in Sources */,
+				AA100009 /* DecisionStore.swift in Sources */,
+				AA100010 /* SessionManager.swift in Sources */,
+				AA100011 /* SidebarView.swift in Sources */,
+				AA100012 /* ChatView.swift in Sources */,
+				AA100013 /* DecisionsView.swift in Sources */,
+				AA100014 /* BridgeProtocol.swift in Sources */,
+				AA100015 /* CodexBridge.swift in Sources */,
+				AA100016 /* CursorBridge.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		B0100001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = BuckTeams/Info.plist;
+				INFOPLIST_KEY_NSMainNibFile = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.buckteams.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		B0100002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = BuckTeams/Info.plist;
+				INFOPLIST_KEY_NSMainNibFile = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.buckteams.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		B0100003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		B0100004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		B1100001 /* Build configuration list for PBXNativeTarget "BuckTeams" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B0100001 /* Debug */,
+				B0100002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B1100002 /* Build configuration list for PBXProject "BuckTeams" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B0100003 /* Debug */,
+				B0100004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = AH100001 /* Project object */;
+}
