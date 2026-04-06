@@ -1,7 +1,7 @@
-# Buck — Claude ↔ ChatGPT Review Bridge
+# Buck — Claude ↔ AI Review Bridge
 
 ## What is Buck?
-Buck is a macOS menu bar app that sends plans to ChatGPT for review and returns the feedback. It removes the manual copy-paste loop.
+Buck is a macOS menu bar app that sends messages to AI apps (ChatGPT, Cursor) via the Accessibility API, or directly to the OpenAI Responses API (Codex channel), and returns responses. It removes the manual copy-paste loop.
 
 ## How to use Buck for plan review
 
@@ -12,7 +12,7 @@ When the user asks you to get GPT's review on a plan, or when in a plan review w
 3. Read GPT's feedback and act on it
 
 ```bash
-# Send a plan file
+# Send a plan file (defaults to ChatGPT, channel "a")
 "$HOME/Mac Projects/buck/buck-review.sh" plan.md
 
 # Send inline text (use --stdin with heredoc to avoid shell quoting issues)
@@ -22,9 +22,28 @@ BUCKEOF
 
 # Custom prompt
 "$HOME/Mac Projects/buck/buck-review.sh" --prompt "Review for security issues" plan.md
+
+# Send to Cursor instead of ChatGPT
+"$HOME/Mac Projects/buck/buck-review.sh" --channel cursor --stdin <<'BUCKEOF'
+message content
+BUCKEOF
+
+# Send to Codex (direct OpenAI API — no desktop app needed)
+"$HOME/Mac Projects/buck/buck-review.sh" --channel codex --stdin <<'BUCKEOF'
+message content
+BUCKEOF
 ```
 
-The script blocks until GPT responds and outputs JSON:
+### Channels
+
+| Channel | Target | Notes |
+|---------|--------|-------|
+| `a` (default) | ChatGPT main window | `AXStandardWindow` subrole |
+| `b` | ChatGPT companion window | `AXSystemDialog` subrole |
+| `cursor` | Cursor AI chat panel | Keyboard simulation + AX bubbles |
+| `codex` | OpenAI Responses API | Direct HTTP — no desktop app needed |
+
+The script blocks until the target responds and outputs JSON:
 ```json
 {
   "status": "approved|feedback|error",
@@ -71,58 +90,36 @@ BUCKEOF
 
 ## Requirements
 - Buck.app is always running as a menu bar app — do NOT launch it before every message
-- ChatGPT desktop app must be open with a visible window
+- For ChatGPT channels: ChatGPT desktop app must be open with a visible window
+- For Cursor channel: Cursor must be running with chat panel open (Cmd+L), and `~/.cursor/argv.json` must contain `"force-renderer-accessibility": true`
+- For Codex channel: requires `~/.buck/codex-config.json` with `api_key` field, or `OPENAI_API_KEY` environment variable
 - If a `buck-review.sh` call fails with a connection/process error, launch Buck and retry:
   ```bash
   open /Applications/Buck.app && sleep 2
   ```
 
-## CursorBridge — Cursor Chat Injection
+## Architecture
 
-CursorBridge sends messages to Cursor's AI chat panel and reads responses via the macOS Accessibility API. It uses keyboard simulation to type (Cursor's Monaco input isn't exposed as an AX text field) and AX tree traversal to read chat bubbles.
+All bridges conform to `BridgeProtocol` (`findApp`, `sendMessage`, `waitForResponse`, `startNewChat`). The coordinator routes requests to the correct bridge based on the `channel` field in the inbox JSON. All bridges share the same 120s response timeout and polling logic.
 
-### How it works
+### Key differences between bridges
 
-1. `AXManualAccessibility` forces Chromium to expose the webview DOM as AX elements
-2. Keyboard simulation (CGEvent posted to Cursor's PID): Cmd+L → clear → type → Enter
-3. Chat bubbles live under `domId="workbench.panel.aichat.*"` → `domId="bubble-*"` → AXStaticText
-4. Response completion detected by text stability (3+ consecutive polls with unchanged text)
-
-### Prerequisites
-
-- `~/.cursor/argv.json` must contain `"force-renderer-accessibility": true` (requires Cursor restart)
-- Buck.app must have Accessibility permission in System Settings
-- Cursor must be running with the chat panel open (Cmd+L)
-
-### Testing
-
-```bash
-# Compile the test script (must be compiled — swift interpreter doesn't work for CGEvent)
-swiftc "$HOME/Mac Projects/buck/test-cursor-bridge.swift" -o /tmp/test-cursor-bridge
-
-# Count chat bubbles
-/tmp/test-cursor-bridge count
-
-# Read last response
-/tmp/test-cursor-bridge read
-
-# Send a message and wait for response
-/tmp/test-cursor-bridge send "Your message here"
-```
-
-### Key differences from ChatGPT bridge
-
-| Aspect | ChatGPT | Cursor |
-|--------|---------|--------|
-| Input | AXValue on AXTextArea | CGEvent keyboard simulation |
-| Send | AXPressAction on send button | CGEvent Enter key |
-| Messages | AXList → AXGroup → AXStaticText | `bubble-*` domId → AXStaticText |
-| AX init | `AXUIElementCreateApplication` | + `AXManualAccessibility` per read |
+| Aspect | ChatGPT | Cursor | Codex |
+|--------|---------|--------|-------|
+| Input | AXValue on AXTextArea | Brief activate + CGEvent postToPid | HTTP POST body |
+| Send | AXPressAction on send button | CGEvent Enter via postToPid | URLSession request |
+| Messages | AXList → AXGroup → AXStaticText | `bubble-*` domId → AXStaticText | JSON response body |
+| AX init | `AXUIElementCreateApplication` | + `AXManualAccessibility` per read | None (no AX) |
+| Completion | Send button reappearance + text stability | Text stability (3-4 polls) | HTTP response received |
 
 ### Source
 
-- `Buck/Buck/CursorBridge.swift` — production bridge (same API shape as ChatGPTBridge)
-- `test-cursor-bridge.swift` — standalone test harness
+- `Buck/Buck/BridgeProtocol.swift` — shared protocol, `BridgeError`, `BuckLog`
+- `Buck/Buck/ChatGPTBridge.swift` — ChatGPT AX bridge
+- `Buck/Buck/CursorBridge.swift` — Cursor AX bridge
+- `Buck/Buck/CodexBridge.swift` — Codex API bridge (direct HTTP, no AX)
+- `Buck/Buck/BuckCoordinator.swift` — routes inbox requests to bridges by channel
+- `test-cursor-bridge.swift` — standalone Cursor test harness
 
 ## BuckSpeak — Voice I/O
 

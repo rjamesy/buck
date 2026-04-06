@@ -17,6 +17,8 @@
 		AA000008 /* OllamaSummarizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000009; };
 		AA000009 /* SessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000010; };
 		AA000011 /* CursorBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000011; };
+		AA000012 /* BridgeProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000012; };
+		AA000013 /* CodexBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000013; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -31,6 +33,8 @@
 		AB000009 /* OllamaSummarizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OllamaSummarizer.swift; sourceTree = "<group>"; };
 		AB000010 /* SessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionManager.swift; sourceTree = "<group>"; };
 		AB000011 /* CursorBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CursorBridge.swift; sourceTree = "<group>"; };
+		AB000012 /* BridgeProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeProtocol.swift; sourceTree = "<group>"; };
+		AB000013 /* CodexBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexBridge.swift; sourceTree = "<group>"; };
 		AC000001 /* Buck.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Buck.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -58,8 +62,10 @@
 			children = (
 				AB000001 /* BuckApp.swift */,
 				AB000002 /* BuckCoordinator.swift */,
+				AB000012 /* BridgeProtocol.swift */,
 				AB000003 /* ChatGPTBridge.swift */,
 				AB000011 /* CursorBridge.swift */,
+				AB000013 /* CodexBridge.swift */,
 				AB000004 /* FileWatcher.swift */,
 				AB000005 /* ResponseWriter.swift */,
 				AB000006 /* Models.swift */,
@@ -160,6 +166,8 @@
 				AA000008 /* OllamaSummarizer.swift in Sources */,
 				AA000009 /* SessionManager.swift in Sources */,
 				AA000011 /* CursorBridge.swift in Sources */,
+				AA000012 /* BridgeProtocol.swift in Sources */,
+				AA000013 /* CodexBridge.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -1,7 +1,9 @@
 import ApplicationServices
 import AppKit
 
-final class ChatGPTBridge {
+final class ChatGPTBridge: BridgeProtocol {
+    let name = "ChatGPT"
+
     /// Which window this bridge targets: "AXStandardWindow" (main) or "AXSystemDialog" (companion)
     let targetSubrole: String
     private var appElement: AXUIElement?
@@ -30,6 +32,8 @@ final class ChatGPTBridge {
     }
 
     // MARK: - Find ChatGPT
+
+    func findApp() throws -> Bool { try findChatGPT() }
 
     func findChatGPT() throws -> Bool {
         guard AXIsProcessTrusted() else {
@@ -354,7 +358,7 @@ final class ChatGPTBridge {
         }
 
         Self.log("Timeout waiting for response (peak=\(peakLength))")
-        throw BuckError.timeout
+        throw BridgeError.timeout
     }
 
     // MARK: - Response Validation
@@ -706,7 +710,6 @@ enum BuckError: LocalizedError {
     case cannotPressSend
     case chatPaneNotFound
     case messagesNotFound
-    case timeout
     case messageSendFailed
 
     var errorDescription: String? {
@@ -721,7 +724,6 @@ enum BuckError: LocalizedError {
         case .cannotPressSend: return "Cannot press send button"
         case .chatPaneNotFound: return "Cannot find chat pane"
         case .messagesNotFound: return "Cannot find messages in chat"
-        case .timeout: return "Timed out waiting for GPT response"
         case .messageSendFailed: return "Message could not be sent after 3 attempts — text stuck in input field"
         }
     }

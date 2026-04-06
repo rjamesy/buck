@@ -204,7 +204,7 @@ func isEcho(_ bubbleText: String, of sentText: String) -> Bool {
 // Poll
 print("Polling for response...")
 var lastText = ""; var stable = 0; var reopens = 0
-for i in 0..<30 {
+for i in 0..<60 {
     Thread.sleep(forTimeInterval: 2.0)
     if currentBubbleIds().isEmpty && reopens < 5 {
         reopens += 1; ensurePanelOpen(); Thread.sleep(forTimeInterval: 1.0)

@@ -242,10 +242,18 @@ while [ $attempt -le $MAX_RETRIES ]; do
 ENDJSON
     mv "$INBOX/$ID.tmp" "$INBOX/$ID.json"
 
+    # Display name based on channel
+    DISPLAY_TARGET="ChatGPT"
+    if [[ "$CHANNEL" == "cursor" ]]; then
+        DISPLAY_TARGET="Cursor"
+    elif [[ "$CHANNEL" == "codex" ]]; then
+        DISPLAY_TARGET="Codex"
+    fi
+
     if [ $attempt -eq 0 ]; then
-        echo "Sent to Buck (id: $ID). Waiting for ChatGPT response..." >&2
+        echo "Sent to Buck (id: $ID). Waiting for $DISPLAY_TARGET response..." >&2
     else
-        echo "Retry $attempt/$MAX_RETRIES (id: $ID). Waiting for ChatGPT response..." >&2
+        echo "Retry $attempt/$MAX_RETRIES (id: $ID). Waiting for $DISPLAY_TARGET response..." >&2
     fi
 
     # Wait for response

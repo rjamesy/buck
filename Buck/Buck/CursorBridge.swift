@@ -14,13 +14,17 @@ import AppKit
 ///
 /// IMPORTANT: Cmd+L TOGGLES the chat panel. Never send it when the panel
 /// is already open — use AXFocused on the composer area instead.
-final class CursorBridge {
+final class CursorBridge: BridgeProtocol {
+    let name = "Cursor"
+
     static let cursorBundleId = "com.todesktop.230313mzl4w4u92"
 
     private var appElement: AXUIElement?
     private var cursorPid: pid_t = 0
 
     // MARK: - Find Cursor
+
+    func findApp() throws -> Bool { try findCursor() }
 
     func findCursor() throws -> Bool {
         guard AXIsProcessTrusted() else {
@@ -57,40 +61,52 @@ final class CursorBridge {
         }
 
         // Ensure panel is open and snapshot bubble IDs before sending.
-        // This snapshot is also used by waitForResponse as the polling baseline
-        // to avoid a race where the response appears between send and poll start.
-        activateCursor()
-        Thread.sleep(forTimeInterval: 0.5)
-        focusChatInput()
+        ensureChatPanelOpen()
         Thread.sleep(forTimeInterval: 0.3)
         let idsBefore = currentBubbleIds()
         preSendBubbleIds = idsBefore
         preSendLastText = (try? readLastResponse()) ?? ""
         sentMessageText = text
 
+        // Save the current frontmost app so we can switch back after typing.
+        // Electron/Chromium requires key focus for keyboard events to reach web content,
+        // so we must briefly activate Cursor — but only once, then restore focus.
+        let previousApp = NSWorkspace.shared.frontmostApplication
+
         for attempt in 1...3 {
             log("Send attempt \(attempt)/3 (bubble IDs before: \(idsBefore.count))")
 
-            activateCursor()
+            guard let win = freshWindow(),
+                  let chatPanel = findByDomId(win, "workbench.panel.aichat"),
+                  let textArea = findElement(in: chatPanel, role: kAXTextAreaRole) else {
+                log("Cannot find chat input AXTextArea on attempt \(attempt)")
+                Thread.sleep(forTimeInterval: 1.0)
+                continue
+            }
+
+            // Activate Cursor once for keyboard input (Electron requires key focus)
+            if let cursorApp = NSRunningApplication.runningApplications(
+                withBundleIdentifier: Self.cursorBundleId
+            ).first {
+                cursorApp.activate()
+            }
             Thread.sleep(forTimeInterval: 0.3)
-            focusChatInput()
-            Thread.sleep(forTimeInterval: 0.3)
+
+            // Focus the text area
+            AXUIElementSetAttributeValue(textArea, kAXFocusedAttribute as CFString, true as CFTypeRef)
+            AXUIElementPerformAction(textArea, kAXPressAction as CFString)
+            Thread.sleep(forTimeInterval: 0.2)
 
             let src = CGEventSource(stateID: .combinedSessionState)
 
             // Clear any existing input: Cmd+A then Delete
-            postKey(src: src, virtualKey: 0x00, flags: .maskCommand) // A
+            postKey(src: src, virtualKey: 0x00, flags: .maskCommand) // Cmd+A
             Thread.sleep(forTimeInterval: 0.1)
-            postKey(src: src, virtualKey: 0x33) // Delete/Backspace
-            Thread.sleep(forTimeInterval: 0.3)
+            postKey(src: src, virtualKey: 0x33) // Delete
+            Thread.sleep(forTimeInterval: 0.2)
 
-            // Type the message character by character.
-            // Re-activate periodically to survive focus contention.
-            for (i, char) in text.unicodeScalars.enumerated() {
-                if i % 100 == 0 && i > 0 {
-                    activateCursor()
-                    Thread.sleep(forTimeInterval: 0.05)
-                }
+            // Type character by character via postToPid
+            for char in text.unicodeScalars {
                 let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true)
                 down?.keyboardSetUnicodeString(stringLength: 1, unicodeString: [UniChar(char.value)])
                 down?.postToPid(cursorPid)
@@ -98,15 +114,16 @@ final class CursorBridge {
                 up?.postToPid(cursorPid)
                 Thread.sleep(forTimeInterval: 0.01)
             }
-
-            Thread.sleep(forTimeInterval: 0.5)
             log("Typed \(text.count) chars")
 
+            Thread.sleep(forTimeInterval: 0.5)
+
             // Press Enter to send
-            activateCursor()
-            Thread.sleep(forTimeInterval: 0.1)
             postKey(src: src, virtualKey: 0x24) // Return
             log("Pressed Enter")
+
+            // Immediately restore previous app focus
+            previousApp?.activate()
 
             // Verify send — check for new bubble domIds
             Thread.sleep(forTimeInterval: 3.0)
@@ -277,7 +294,7 @@ final class CursorBridge {
         }
 
         log("Timeout waiting for response (peak=\(peakLength))")
-        throw CursorBridgeError.timeout
+        throw BridgeError.timeout
     }
 
     // MARK: - New Chat
@@ -330,64 +347,16 @@ final class CursorBridge {
         return false
     }
 
-    // MARK: - Focus Chat Input
-
-    /// Focus the chat input without toggling the panel.
-    ///
-    /// Cmd+L TOGGLES the panel (open↔closed). We must NOT use it when
-    /// the panel is already open. Instead, we find the AXTextArea
-    /// (the actual Monaco editor input) inside the chat panel and set
-    /// AXFocused directly on it.
-    ///
-    /// Note: composer-toolbar-section is the "9 Files / Undo All / Keep All"
-    /// action bar — NOT the text input. The real input is an AXTextArea
-    /// deeper in the tree (depth ~12).
-    ///
-    /// If the panel is closed, we use Cmd+L to open it (safe — goes
-    /// from closed to open, which always focuses the input).
-    private func focusChatInput() {
-        guard let win = freshWindow() else { return }
-
-        if let chatPanel = findByDomId(win, "workbench.panel.aichat") {
-            // Panel is open — focus the AXTextArea directly (never Cmd+L)
-            if let textArea = findElement(in: chatPanel, role: kAXTextAreaRole) {
-                AXUIElementSetAttributeValue(textArea, kAXFocusedAttribute as CFString, true as CFTypeRef)
-                AXUIElementPerformAction(textArea, kAXPressAction as CFString)
-                log("Focused AXTextArea directly")
-            } else {
-                AXUIElementSetAttributeValue(chatPanel, kAXFocusedAttribute as CFString, true as CFTypeRef)
-                log("Focused chat panel via AX (AXTextArea not found)")
-            }
-        } else {
-            // Panel is closed — Cmd+L opens it and focuses the input
-            log("Chat panel closed, opening with Cmd+L")
-            let src = CGEventSource(stateID: .combinedSessionState)
-            postKey(src: src, virtualKey: 0x25, flags: .maskCommand) // Cmd+L
-            Thread.sleep(forTimeInterval: 1.0)
-            // Now focus the AXTextArea in the newly opened panel
-            if let w2 = freshWindow(),
-               let cp2 = findByDomId(w2, "workbench.panel.aichat"),
-               let ta = findElement(in: cp2, role: kAXTextAreaRole) {
-                AXUIElementSetAttributeValue(ta, kAXFocusedAttribute as CFString, true as CFTypeRef)
-                AXUIElementPerformAction(ta, kAXPressAction as CFString)
-                log("Focused AXTextArea after Cmd+L open")
-            }
-        }
-    }
-
     // MARK: - Ensure Chat Panel Open
 
     /// Reopen the chat panel if it was closed (e.g. after agent mode send).
-    /// Only sends Cmd+L when the panel is confirmed to be absent.
+    /// Uses Cmd+L via postToPid (no activation — delivers directly to Cursor process).
     private func ensureChatPanelOpen() {
         if let win = freshWindow(), findByDomId(win, "workbench.panel.aichat") != nil {
             return
         }
 
-        log("Chat panel not visible, sending Cmd+L to reopen")
-        activateCursor()
-        Thread.sleep(forTimeInterval: 0.3)
-
+        log("Chat panel not visible, sending Cmd+L via postToPid")
         let src = CGEventSource(stateID: .combinedSessionState)
         postKey(src: src, virtualKey: 0x25, flags: .maskCommand) // Cmd+L
         Thread.sleep(forTimeInterval: 1.5)
@@ -397,15 +366,6 @@ final class CursorBridge {
         } else {
             log("Chat panel still not found after Cmd+L")
         }
-    }
-
-    // MARK: - Activate Cursor
-
-    private func activateCursor() {
-        guard let app = NSRunningApplication.runningApplications(
-            withBundleIdentifier: Self.cursorBundleId
-        ).first else { return }
-        app.activate()
     }
 
     // MARK: - AX Tree Navigation
@@ -548,7 +508,6 @@ enum CursorBridgeError: LocalizedError {
     case noWindow
     case chatPanelNotFound
     case messagesNotFound
-    case timeout
     case messageSendFailed
 
     var errorDescription: String? {
@@ -563,10 +522,8 @@ enum CursorBridgeError: LocalizedError {
             return "Cannot find Cursor chat panel — is it open? (Cmd+L)"
         case .messagesNotFound:
             return "Cannot find messages in Cursor chat"
-        case .timeout:
-            return "Timed out waiting for Cursor response"
         case .messageSendFailed:
-            return "Message could not be sent after 3 attempts — keystrokes may have been lost to focus contention"
+            return "Message could not be sent after 3 attempts — AXValue or postToPid delivery failed"
         }
     }
 }

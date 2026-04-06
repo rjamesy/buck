@@ -2,7 +2,7 @@
 
 > Let your AI coding agents talk to each other — and to any desktop AI app.
 
-Buck is a macOS toolkit that bridges AI coding assistants (Claude Code, Codex, Cursor, etc.) with desktop AI apps (ChatGPT, Cursor IDE) via the Accessibility API. It automates the copy-paste review loop: your coding agent writes a plan, Buck injects it into the target app, the target reviews it, and Buck pipes the feedback back — all without you touching the keyboard.
+Buck is a macOS toolkit that bridges AI coding assistants (Claude Code, Codex, Cursor, etc.) with desktop AI apps (ChatGPT, Cursor IDE) via the Accessibility API, or directly with OpenAI models via the Responses API (Codex channel). It automates the copy-paste review loop: your coding agent writes a plan, Buck injects it into the target app (or calls the API), the target reviews it, and Buck pipes the feedback back — all without you touching the keyboard.
 
 ## Components
 
@@ -10,6 +10,7 @@ Buck is a macOS toolkit that bridges AI coding assistants (Claude Code, Codex, C
 |-----------|------|---------|
 | **Buck** | Menu bar app | Core ChatGPT bridge — send/read messages via AX API |
 | **CursorBridge** | Module in Buck | Cursor IDE chat injection — keyboard simulation + AX bubble reading |
+| **CodexBridge** | Module in Buck | OpenAI Responses API — direct HTTP calls, no desktop app needed |
 | **Rogers** | Menu bar app | ChatGPT session archiver — polls AX tree, stores in SQLite, summarizes via Ollama |
 | **BuckTeams** | Window app | Multi-AI group chat (User + Claude + Codex + GPT) — partial implementation |
 | **BuckCodex** | Window app | OpenAI Codex UI — direct API client for local Codex sessions |
@@ -46,7 +47,32 @@ Claude Code / Codex                    Buck (menu bar)                   ChatGPT
 
 No network calls. No API keys. Just file-based IPC and the Accessibility API.
 
-### Cursor Bridge (new)
+### Codex Bridge (direct API)
+
+```
+Claude Code / Codex                    Buck (menu bar)                   OpenAI API
+       |                                    |                                  |
+       |-- writes JSON to ~/.buck/inbox/ -->|                                  |
+       |                                    |-- POST /v1/responses ----------->|
+       |                                    |                                  |
+       |                                    |<-- JSON response ----------------|
+       |                                    |                                  |
+       |<-- writes JSON to ~/.buck/outbox/ -|                                  |
+       |                                    |                                  |
+       |  (reads response, acts on it)      |                                  |
+```
+
+Unlike ChatGPT and Cursor bridges, CodexBridge makes direct HTTP calls to the OpenAI Responses API. No desktop app, no Accessibility API — just a REST call. Same file-based IPC, same `buck-review.sh` interface, same JSON response format.
+
+Requires `~/.buck/codex-config.json`:
+```json
+{
+  "api_key": "sk-proj-...",
+  "model": "gpt-5.3-codex"
+}
+```
+
+### Cursor Bridge
 
 ```
 Any process                  test-cursor-bridge              Cursor IDE
@@ -64,17 +90,19 @@ Any process                  test-cursor-bridge              Cursor IDE
 Cursor is Electron/Chromium. Its webview doesn't expose content to AX by default. CursorBridge solves this:
 
 1. **AXManualAccessibility** forces Chromium to build an AX tree from the webview DOM
-2. **AX focus** on `composer-toolbar-section` focuses the chat input without toggling the panel (Cmd+L is a toggle — sending it when the panel is open closes it)
-3. **CGEvent.postToPid** types the message character-by-character and presses Enter
+2. **Brief activation** — Cursor is activated once (Electron requires key focus for keyboard events), then the previous app is immediately restored after typing
+3. **CGEvent.postToPid** types the message character-by-character and presses Enter (direct PID delivery)
 4. **domId tracking** verifies the message was delivered (new `bubble-*` IDs, immune to scroll-induced count changes)
 5. **Text stability polling** on the last bubble detects response completion
+
+Note: AXValue cannot be used to inject text into Cursor's Monaco editor (it updates the AX tree but not the editor state). Keyboard simulation via `postToPid` is required.
 
 Requires `"force-renderer-accessibility": true` in `~/.cursor/argv.json` (one-time setup, Cursor restart needed).
 
 ## Features
 
 - **Menu bar app** — no dock icon, always running silently in the background
-- **Two AI targets** — ChatGPT (AXValue + button press) and Cursor (keyboard simulation + AX bubble reading)
+- **Three AI targets** — ChatGPT (AXValue + button press, fully background), Cursor (brief activate + postToPid + auto-restore), and Codex (direct OpenAI API, no app needed)
 - **File-based IPC** — JSON in/out via `~/.buck/inbox/` and `~/.buck/outbox/`
 - **Smart response detection** — multiple heuristics to know when GPT is done:
   - Text stability across consecutive polls
@@ -84,7 +112,7 @@ Requires `"force-renderer-accessibility": true` in `~/.cursor/argv.json` (one-ti
   - Tool-use indicator filtering ("Looked at Terminal", etc.)
 - **Automatic retry** — message send retries (3 attempts), shell script retries (configurable)
 - **Send verification** — confirms message delivery via domId diffing before polling for response
-- **Focus resilience** — periodic re-activation during typing to survive focus contention from other apps
+- **Focus resilience** — Cursor briefly activates for typing then immediately restores the previous app
 - **Concurrency control** — one request at a time per channel, in-flight rejection with graceful retry
 - **Atomic file writes** — write to `.tmp`, rename to `.json` (no partial reads)
 - **Structured prompts** — default prompt enforces strict APPROVED/FEEDBACK first-line contract with `<plan>` tag isolation
@@ -106,6 +134,7 @@ Buck/Buck/
 ├── BuckCoordinator.swift   Request orchestration, state management, approval detection
 ├── ChatGPTBridge.swift     ChatGPT AX bridge: send messages, read responses, poll for completion
 ├── CursorBridge.swift      Cursor AX bridge: keyboard simulation, bubble reading, AX focus
+├── CodexBridge.swift       Codex API bridge: direct HTTP to OpenAI Responses API
 ├── FileWatcher.swift       DispatchSource + timer fallback watching ~/.buck/inbox/
 ├── ResponseWriter.swift    Atomic JSON writes to ~/.buck/outbox/
 ├── Models.swift            ReviewRequest / ReviewResponse codables
@@ -128,7 +157,7 @@ BuckSpeakV3/                Voice I/O for Teams context
 
 | Script | Purpose |
 |--------|---------|
-| `buck-review.sh` | CLI for sending reviews to ChatGPT via Buck |
+| `buck-review.sh` | CLI for sending reviews to ChatGPT, Cursor, or Codex via Buck |
 | `buck-speak.sh` | CLI for voice I/O via BuckSpeak |
 | `buck-teams.sh` | CLI for multi-AI group chat via BuckTeams |
 | `buck-exec.sh` | CLI for autonomous code execution via Buck |
@@ -233,18 +262,20 @@ Prerequisites:
 | `--text "..."` | — | Inline content (use --stdin for long text) |
 | `--session ID` | — | Session UUID for history tracking and compact |
 | `--timeout N` | 720 | Seconds to wait for response |
-| `--channel X` | `$BUCK_CHANNEL` or none | Target channel (`a` = main window, `b` = companion chat) |
+| `--channel X` | `$BUCK_CHANNEL` or none | Target channel (`a` = main window, `b` = companion chat, `cursor`, `codex`) |
 | `--caller NAME` | `$BUCK_CALLER` or none | Caller identifier (e.g. `claude`, `codex`) — sets menu bar icon color |
 | `--retries N` | 2 | Max retries on error |
 
 ### Multi-channel
 
-Buck supports independent channels so multiple Claude Code sessions can each talk to their own ChatGPT window:
+Buck supports independent channels so multiple Claude Code sessions can each talk to their own AI target:
 
-| Channel | ChatGPT window | AX subrole |
-|---------|---------------|------------|
-| `a` (default) | Main window | `AXStandardWindow` |
-| `b` | Companion chat | `AXSystemDialog` |
+| Channel | Target | Method |
+|---------|--------|--------|
+| `a` (default) | ChatGPT main window | AX API (`AXStandardWindow`) |
+| `b` | ChatGPT companion chat | AX API (`AXSystemDialog`) |
+| `cursor` | Cursor IDE chat panel | Keyboard simulation + AX |
+| `codex` | OpenAI Responses API | Direct HTTP (no desktop app) |
 
 ```bash
 # Via env var
@@ -254,6 +285,11 @@ BUCKEOF
 
 # Via flag
 buck-review.sh --channel b --stdin <<'BUCKEOF'
+content
+BUCKEOF
+
+# Send to Codex (direct API)
+buck-review.sh --channel codex --stdin <<'BUCKEOF'
 content
 BUCKEOF
 ```
@@ -360,6 +396,7 @@ These are natural language triggers from the global CLAUDE.md instructions, not 
 | `~/.buck/outbox/` | Outgoing review responses (JSON) |
 | `~/.buck/logs/buck.log` | Debug log (Buck + CursorBridge) |
 | `~/.buck/history.db` | SQLite session history (7-day retention) |
+| `~/.buck/codex-config.json` | Codex bridge config (API key + model) |
 | `~/.buckspeak/inbox/` | BuckSpeak IPC requests |
 | `~/.buckspeak/outbox/` | BuckSpeak IPC responses |
 | `~/.buckteams/chat.jsonl` | BuckTeams chat log (NDJSON) |
@@ -372,6 +409,7 @@ These are natural language triggers from the global CLAUDE.md instructions, not 
 - Xcode 15+ (to build)
 - ChatGPT desktop app (for ChatGPT bridge)
 - Cursor IDE (for Cursor bridge) with `force-renderer-accessibility: true` in `~/.cursor/argv.json`
+- OpenAI API key (for Codex bridge) — set in `~/.buck/codex-config.json`
 - Accessibility permission granted to Buck (and/or compiled test binaries)
 - Ollama with `qwen2.5:3b-instruct` model (optional — for session summarization)
 
