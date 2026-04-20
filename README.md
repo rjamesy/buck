@@ -15,6 +15,8 @@ Buck is a macOS toolkit that bridges AI coding assistants (Claude Code, Codex, C
 | **BuckTeams** | Window app | Multi-AI group chat — GPT + Codex via OpenAI API, Claude via file IPC |
 | **BuckCodex** | Window app | OpenAI Codex UI — direct API client for local Codex sessions |
 | **BuckSpeak** | Menu bar app | Voice I/O — text-to-speech and speech recognition for voice-loop testing |
+| **TwilioBridge** | Module in Buck | SMS notifications — push info or questions to the user's phone via Twilio; polls inbound replies |
+| **buck-notify.sh** | Shell CLI | User-friendly wrapper for the TwilioBridge (info-push and ask-and-wait-for-reply) |
 
 ## How It Works
 
@@ -313,6 +315,74 @@ buck-review.sh --caller claude --stdin <<'BUCKEOF'
 content
 BUCKEOF
 ```
+
+## buck-notify — SMS notifications (Twilio)
+
+`buck-notify.sh` lets Claude reach you by SMS when you're away from the terminal. Two modes:
+
+```bash
+# Fire-and-forget info push (phone shows: INFO-<msg>)
+~/Mac\ Projects/buck/buck-notify.sh --info "Build passed, deploying..."
+
+# Ask a question and wait up to 10 minutes for an SMS reply (phone shows: QUES-<msg>)
+~/Mac\ Projects/buck/buck-notify.sh --ask "Proceed with migration? (yes/no)"
+
+# Ask with a custom reply timeout
+~/Mac\ Projects/buck/buck-notify.sh --ask "Short question" --timeout 60
+```
+
+Output JSON:
+
+```json
+{ "status": "sent|reply|error", "response": "..." }
+```
+
+- `status: sent` — info pushed (`response` is `"sent"`).
+- `status: reply` — user replied; `response` is the reply text verbatim.
+- `status: error` — timeout, rate-limited, or Twilio API error.
+
+### How it works
+
+1. The shell writes a JSON request to `~/.buck/inbox/` with `channel: "twilio"` and a `[BUCK-MODE:info]` or `[BUCK-MODE:ask:N]` tag.
+2. Buck's `TwilioBridge` POSTs the SMS via Twilio's Messages API.
+3. For `--ask`, the bridge then polls `GET /Messages.json?From=<user>` every 5 s and returns the first inbound reply newer than the send timestamp.
+4. If the user doesn't reply in time, the bridge auto-forwards the question to the ChatGPT channel as a fallback and returns `"[via=chatgpt_fallback] <answer>"`.
+
+No webhook / public endpoint is needed — replies are retrieved by polling Twilio's REST API.
+
+### Safety limits
+
+All enforced by `TwilioBridge`, configurable in `~/.buck/twilio-config.json`:
+
+| Limit | Default | Config key |
+|---|---|---|
+| Max message length (truncated with `...`) | 480 chars | `max_message_length` |
+| Max sends per rolling 60 min | 20 | `max_per_hour` |
+| Minimum interval between sends | 2 s | `min_interval_sec` |
+
+Send timestamps persist to `~/.buck/twilio-rate.json` so limits survive Buck restarts. Only successful Twilio POSTs count.
+
+### Setup (one-time)
+
+Create `~/.buck/twilio-config.json` (mode 600):
+
+```json
+{
+  "account_sid": "AC...",
+  "auth_token":  "...",
+  "from_number": "+15551234567",
+  "to_number":   "+61412345678"
+}
+```
+
+Twilio's default auto-reply ("Thanks for the message. Configure your number's SMS URL...") can be silenced by creating a TwiML Bin in the Twilio console with:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Response></Response>
+```
+
+…and setting "A MESSAGE COMES IN" on the phone number to use that bin.
 
 ## BuckSpeak — Voice I/O
 
