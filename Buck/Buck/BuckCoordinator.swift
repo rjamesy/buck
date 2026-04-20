@@ -54,7 +54,17 @@ class BuckCoordinator: ObservableObject {
         // Codex channel (direct OpenAI API — no desktop app needed)
         channels["codex"] = ChannelState(bridge: CodexBridge())
         // Twilio SMS channel (notifications — no desktop app needed)
-        channels["twilio"] = ChannelState(bridge: TwilioBridge())
+        let twilio = TwilioBridge()
+        channels["twilio"] = ChannelState(bridge: twilio)
+        // Wire the ask-timeout fallback: if the user doesn't reply by SMS, forward
+        // the question to the ChatGPT channel so Claude still gets an answer.
+        twilio.onAskTimeout = { [weak self] question in
+            guard let self else {
+                throw TwilioBridgeError.apiError("Coordinator deallocated before fallback")
+            }
+            let prompt = "[SMS TIMEOUT FALLBACK] The user did not reply to this question by SMS in time. Please answer it directly:\n\n\(question)"
+            return try await self.forward(to: "a", prompt: prompt, timeout: 120)
+        }
         checkAccessibility()
         startWatching()
     }
@@ -314,5 +324,43 @@ class BuckCoordinator: ObservableObject {
         }
 
         try? FileManager.default.removeItem(at: url)
+    }
+
+    // MARK: - Bridge-to-bridge forwarding
+    //
+    // Used by bridges that need to hand off work to another channel (currently:
+    // TwilioBridge's SMS-timeout → ChatGPT fallback). Acquires the target
+    // channel's lock, runs the full findApp/send/wait cycle, releases the lock.
+    // Callers must NOT already hold the target channel's lock — that would
+    // deadlock. Cross-channel calls are fine (twilio → a).
+    func forward(to channelName: String, prompt: String, timeout: TimeInterval) async throws -> String {
+        channelLock.lock()
+        guard channels[channelName] != nil else {
+            channelLock.unlock()
+            throw TwilioBridgeError.apiError("Unknown forward channel: \(channelName)")
+        }
+        if channels[channelName]!.isProcessing {
+            channelLock.unlock()
+            throw TwilioBridgeError.apiError("Forward target channel \(channelName) is busy")
+        }
+        channels[channelName]!.isProcessing = true
+        channels[channelName]!.activeRequestId = "fwd_\(UUID().uuidString.prefix(8))"
+        let bridge = channels[channelName]!.bridge
+        channelLock.unlock()
+
+        defer {
+            channelLock.lock()
+            channels[channelName]!.isProcessing = false
+            channels[channelName]!.activeRequestId = nil
+            channels[channelName]!.caller = .none
+            channelLock.unlock()
+        }
+
+        BuckLog.log("[Forward] → channel \(channelName) (\(bridge.name))")
+        _ = try bridge.findApp()
+        try bridge.sendMessage(prompt)
+        let result = try await bridge.waitForResponse(timeout: timeout)
+        BuckLog.log("[Forward] ← channel \(channelName) responded (\(result.count) chars)")
+        return result
     }
 }

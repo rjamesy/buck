@@ -22,6 +22,12 @@ final class TwilioBridge: BridgeProtocol {
     private var toNumber: String = ""
     private var pendingMessage: String = ""
 
+    /// Optional fallback invoked when an `ask` poll loop hits its timeout.
+    /// The coordinator wires this to forward the question to the ChatGPT
+    /// channel so Claude still gets an answer when the user doesn't reply.
+    /// If nil, ask-mode timeouts simply throw `BridgeError.timeout`.
+    var onAskTimeout: ((String) async throws -> String)?
+
     // MARK: - Config
 
     private struct TwilioConfig: Codable {
@@ -100,7 +106,14 @@ final class TwilioBridge: BridgeProtocol {
 
         let waitSec = parsed.timeoutSec ?? 600
         BuckLog.log("[TwilioBridge] Polling for reply from \(toNumber) (timeout \(waitSec)s)")
-        return try await pollForReply(since: sinceDate, timeout: TimeInterval(waitSec))
+        do {
+            return try await pollForReply(since: sinceDate, timeout: TimeInterval(waitSec))
+        } catch BridgeError.timeout {
+            guard let fallback = onAskTimeout else { throw BridgeError.timeout }
+            BuckLog.log("[TwilioBridge] ask timeout — invoking ChatGPT fallback")
+            let fallbackAnswer = try await fallback(parsed.body)
+            return "[via=chatgpt_fallback] " + fallbackAnswer
+        }
     }
 
     func startNewChat() {
