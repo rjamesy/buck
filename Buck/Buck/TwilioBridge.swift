@@ -2,9 +2,17 @@ import Foundation
 
 /// Bridge that sends SMS via the Twilio REST API (no desktop app needed).
 ///
-/// Phase 1: info-push only. `waitForResponse` returns "sent" immediately after
-/// the outgoing SMS is accepted by Twilio. Phase 2 will add `ask` mode with
-/// inbound polling; Phase 3 will add a ChatGPT fallback on timeout.
+/// Two modes, selected by a `[BUCK-MODE:<mode>[:<timeout>]]` prefix on the
+/// outgoing prompt:
+///   • `info` — send SMS, return "sent" immediately.
+///   • `ask[:N]` — send SMS, then poll Twilio's Messages API for an inbound
+///     reply from `to_number`. Default wait is 600s (10 min); `:N` overrides.
+///     Throws `BridgeError.timeout` if no reply arrives in time.
+///
+/// The coordinator's `timeout:` parameter is advisory only; this bridge uses
+/// the encoded ask timeout (or 600s default) because the coordinator's default
+/// is 120s and SMS replies routinely take longer. Phase 3 will add a ChatGPT
+/// fallback on timeout.
 final class TwilioBridge: BridgeProtocol {
     let name = "Twilio"
 
@@ -76,12 +84,23 @@ final class TwilioBridge: BridgeProtocol {
         let raw = pendingMessage
         pendingMessage = ""
 
-        let (_, body) = parseMode(from: raw)
+        let parsed = parseMode(from: raw)
 
-        BuckLog.log("[TwilioBridge] Sending SMS to \(toNumber) (\(body.count) chars)")
-        try await postMessage(body: body)
+        // Capture the send time BEFORE POSTing, with a small buffer, so we only
+        // pick up inbound messages that arrive after this outbound SMS.
+        let sinceDate = Date().addingTimeInterval(-2)
+
+        BuckLog.log("[TwilioBridge] Sending SMS to \(toNumber) (\(parsed.body.count) chars, mode=\(parsed.mode))")
+        try await postMessage(body: parsed.body)
         BuckLog.log("[TwilioBridge] SMS accepted by Twilio")
-        return "sent"
+
+        if parsed.mode == "info" {
+            return "sent"
+        }
+
+        let waitSec = parsed.timeoutSec ?? 600
+        BuckLog.log("[TwilioBridge] Polling for reply from \(toNumber) (timeout \(waitSec)s)")
+        return try await pollForReply(since: sinceDate, timeout: TimeInterval(waitSec))
     }
 
     func startNewChat() {
@@ -90,22 +109,22 @@ final class TwilioBridge: BridgeProtocol {
 
     // MARK: - Helpers
 
-    /// Strip a leading `[BUCK-MODE:info]` / `[BUCK-MODE:ask]` tag (optionally preceded by
-    /// whitespace from the coordinator's `prefix\n\ncontent` concatenation) and return
-    /// (mode, body). Default mode is "info" when no tag is present.
-    private func parseMode(from text: String) -> (mode: String, body: String) {
+    /// Parse a leading `[BUCK-MODE:info]` / `[BUCK-MODE:ask]` / `[BUCK-MODE:ask:<N>]`
+    /// tag and return the mode, optional timeout override in seconds, and the stripped
+    /// body. Default mode is "info" when no tag is present.
+    private func parseMode(from text: String) -> (mode: String, timeoutSec: Int?, body: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.hasPrefix("[BUCK-MODE:info]") {
-            let body = String(trimmed.dropFirst("[BUCK-MODE:info]".count))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return ("info", body)
+        // Find a [BUCK-MODE:...] prefix
+        guard trimmed.hasPrefix("[BUCK-MODE:"), let close = trimmed.firstIndex(of: "]") else {
+            return ("info", nil, trimmed)
         }
-        if trimmed.hasPrefix("[BUCK-MODE:ask]") {
-            let body = String(trimmed.dropFirst("[BUCK-MODE:ask]".count))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return ("ask", body)
-        }
-        return ("info", trimmed)
+        let tag = String(trimmed[trimmed.index(trimmed.startIndex, offsetBy: "[BUCK-MODE:".count)..<close])
+        let parts = tag.split(separator: ":", maxSplits: 1).map(String.init)
+        let mode = parts.first ?? "info"
+        let timeoutSec: Int? = (parts.count > 1) ? Int(parts[1]) : nil
+        let bodyStart = trimmed.index(after: close)
+        let body = String(trimmed[bodyStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (mode == "ask" ? "ask" : "info", timeoutSec, body)
     }
 
     private func postMessage(body: String) async throws {
@@ -151,6 +170,99 @@ final class TwilioBridge: BridgeProtocol {
                 return "\(k)=\(v)"
             }
             .joined(separator: "&")
+    }
+
+    // MARK: - Inbound reply polling
+
+    private struct MessagesPage: Codable {
+        let messages: [InboundMessage]
+    }
+
+    private struct InboundMessage: Codable {
+        let body: String?
+        let dateSent: String?
+        let direction: String?
+        let from: String?
+
+        enum CodingKeys: String, CodingKey {
+            case body, direction, from
+            case dateSent = "date_sent"
+        }
+    }
+
+    private static let twilioDateParser: DateFormatter = {
+        let f = DateFormatter()
+        // Twilio returns RFC 2822: "Mon, 20 Apr 2026 06:51:35 +0000"
+        f.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        return f
+    }()
+
+    private func pollForReply(since: Date, timeout: TimeInterval) async throws -> String {
+        let deadline = Date().addingTimeInterval(timeout)
+        var tick = 0
+
+        while Date() < deadline {
+            tick += 1
+            if let reply = try await fetchLatestReply(since: since) {
+                BuckLog.log("[TwilioBridge] Got reply after \(tick) polls: \(reply.prefix(80))")
+                return reply
+            }
+            BuckLog.log("[TwilioBridge] poll tick \(tick) — no reply yet")
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+        }
+        BuckLog.log("[TwilioBridge] No reply within \(Int(timeout))s")
+        throw BridgeError.timeout
+    }
+
+    private func fetchLatestReply(since: Date) async throws -> String? {
+        var components = URLComponents(string: "https://api.twilio.com/2010-04-01/Accounts/\(accountSid)/Messages.json")!
+        components.queryItems = [
+            URLQueryItem(name: "From", value: toNumber),
+            URLQueryItem(name: "PageSize", value: "20")
+        ]
+        guard let url = components.url else {
+            throw TwilioBridgeError.apiError("Could not build Twilio URL")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        let basic = "\(accountSid):\(authToken)".data(using: .utf8)!.base64EncodedString()
+        request.setValue("Basic \(basic)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 15
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let error as URLError where error.code == .timedOut {
+            // Treat a single poll timeout as transient — the outer loop retries.
+            BuckLog.log("[TwilioBridge] poll HTTP timeout, will retry")
+            return nil
+        }
+
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status >= 400 {
+            let rawBody = String(data: data, encoding: .utf8) ?? ""
+            throw TwilioBridgeError.apiError("HTTP \(status) from Twilio poll: \(rawBody)")
+        }
+
+        let page = try JSONDecoder().decode(MessagesPage.self, from: data)
+
+        // Twilio returns messages newest-first; find the newest inbound one after sinceDate.
+        for msg in page.messages {
+            guard msg.direction == "inbound",
+                  msg.from == toNumber,
+                  let ds = msg.dateSent,
+                  let sent = Self.twilioDateParser.date(from: ds),
+                  sent > since,
+                  let body = msg.body else {
+                continue
+            }
+            return body
+        }
+        return nil
     }
 }
 
