@@ -11,8 +11,15 @@ import Foundation
 ///
 /// The coordinator's `timeout:` parameter is advisory only; this bridge uses
 /// the encoded ask timeout (or 600s default) because the coordinator's default
-/// is 120s and SMS replies routinely take longer. Phase 3 will add a ChatGPT
-/// fallback on timeout.
+/// is 120s and SMS replies routinely take longer. On ask timeout, an optional
+/// `onAskTimeout` closure (wired by the coordinator) forwards the question to
+/// the ChatGPT channel as a fallback.
+///
+/// Safety limits (Phase 4): each send is gated by a rolling 60-minute cap
+/// (default 20/hr) and a minimum send interval (default 2 s). Timestamps are
+/// persisted to ~/.buck/twilio-rate.json so limits survive Buck restarts.
+/// Message bodies longer than `max_message_length` (default 480) are truncated
+/// with a trailing ellipsis.
 final class TwilioBridge: BridgeProtocol {
     let name = "Twilio"
 
@@ -21,6 +28,11 @@ final class TwilioBridge: BridgeProtocol {
     private var fromNumber: String = ""
     private var toNumber: String = ""
     private var pendingMessage: String = ""
+
+    // Safety limits (Phase 4). Configurable via optional keys in twilio-config.json.
+    private var maxMessageLength: Int = 480         // 3 SMS segments (160 GSM-7 each)
+    private var maxPerHour: Int = 20                // rolling 60-min cap
+    private var minIntervalSec: Double = 2.0        // min gap between sends
 
     /// Optional fallback invoked when an `ask` poll loop hits its timeout.
     /// The coordinator wires this to forward the question to the ChatGPT
@@ -35,12 +47,18 @@ final class TwilioBridge: BridgeProtocol {
         let authToken: String?
         let fromNumber: String?
         let toNumber: String?
+        let maxMessageLength: Int?
+        let maxPerHour: Int?
+        let minIntervalSec: Double?
 
         enum CodingKeys: String, CodingKey {
             case accountSid = "account_sid"
             case authToken = "auth_token"
             case fromNumber = "from_number"
             case toNumber = "to_number"
+            case maxMessageLength = "max_message_length"
+            case maxPerHour = "max_per_hour"
+            case minIntervalSec = "min_interval_sec"
         }
     }
 
@@ -58,7 +76,10 @@ final class TwilioBridge: BridgeProtocol {
             authToken = config.authToken ?? ""
             fromNumber = config.fromNumber ?? ""
             toNumber = config.toNumber ?? ""
-            BuckLog.log("[TwilioBridge] Config loaded (from: \(fromNumber) to: \(toNumber))")
+            if let v = config.maxMessageLength, v > 0 { maxMessageLength = v }
+            if let v = config.maxPerHour, v > 0 { maxPerHour = v }
+            if let v = config.minIntervalSec, v >= 0 { minIntervalSec = v }
+            BuckLog.log("[TwilioBridge] Config loaded (from: \(fromNumber) to: \(toNumber); limits: \(maxMessageLength) chars, \(maxPerHour)/hr, \(minIntervalSec)s gap)")
         } else {
             BuckLog.log("[TwilioBridge] No config at \(configPath.path), will try env vars")
         }
@@ -92,13 +113,20 @@ final class TwilioBridge: BridgeProtocol {
 
         let parsed = parseMode(from: raw)
 
+        // Rate-limit check (cheap, local). Throws if over cap or under min interval.
+        try checkRateLimit()
+
+        // Length safety — truncate oversize bodies with an ellipsis rather than reject.
+        let body = truncateIfNeeded(parsed.body)
+
         // Capture the send time BEFORE POSTing, with a small buffer, so we only
         // pick up inbound messages that arrive after this outbound SMS.
         let sinceDate = Date().addingTimeInterval(-2)
 
-        BuckLog.log("[TwilioBridge] Sending SMS to \(toNumber) (\(parsed.body.count) chars, mode=\(parsed.mode))")
-        try await postMessage(body: parsed.body)
+        BuckLog.log("[TwilioBridge] Sending SMS to \(toNumber) (\(body.count) chars, mode=\(parsed.mode))")
+        try await postMessage(body: body)
         BuckLog.log("[TwilioBridge] SMS accepted by Twilio")
+        recordSend()   // record only on successful POST
 
         if parsed.mode == "info" {
             return "sent"
@@ -277,6 +305,84 @@ final class TwilioBridge: BridgeProtocol {
         }
         return nil
     }
+
+    // MARK: - Safety: length + rate limit
+
+    private func truncateIfNeeded(_ body: String) -> String {
+        guard body.count > maxMessageLength else { return body }
+        // Reserve 3 chars for the ellipsis.
+        let kept = body.prefix(max(0, maxMessageLength - 3))
+        let truncated = String(kept) + "..."
+        BuckLog.log("[TwilioBridge] Message truncated from \(body.count) → \(truncated.count) chars (cap \(maxMessageLength))")
+        return truncated
+    }
+
+    private static let ratePath: URL = {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".buck/twilio-rate.json")
+    }()
+
+    private struct RateState: Codable {
+        var sends: [String]   // ISO8601 timestamps
+    }
+
+    private func loadRateState() -> RateState {
+        guard let data = try? Data(contentsOf: Self.ratePath),
+              let state = try? JSONDecoder().decode(RateState.self, from: data) else {
+            return RateState(sends: [])
+        }
+        return state
+    }
+
+    private func writeRateState(_ state: RateState) {
+        guard let data = try? JSONEncoder().encode(state) else { return }
+        let tmp = Self.ratePath.appendingPathExtension("tmp")
+        do {
+            try data.write(to: tmp, options: .atomic)
+            try? FileManager.default.removeItem(at: Self.ratePath)
+            try FileManager.default.moveItem(at: tmp, to: Self.ratePath)
+        } catch {
+            BuckLog.log("[TwilioBridge] rate state write failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func checkRateLimit() throws {
+        let iso = ISO8601DateFormatter()
+        let now = Date()
+        let horizon = now.addingTimeInterval(-3600)
+
+        let state = loadRateState()
+        let recentDates = state.sends.compactMap { iso.date(from: $0) }.filter { $0 > horizon }
+
+        // Minimum interval between sends.
+        if let last = recentDates.max() {
+            let gap = now.timeIntervalSince(last)
+            if gap < minIntervalSec {
+                let wait = Int((minIntervalSec - gap).rounded(.up))
+                throw TwilioBridgeError.rateLimited("Min interval \(minIntervalSec)s not met — wait \(wait)s and retry")
+            }
+        }
+
+        // Rolling-hour cap.
+        if recentDates.count >= maxPerHour {
+            let oldest = recentDates.min()!
+            let expiresIn = max(0, Int(oldest.addingTimeInterval(3600).timeIntervalSince(now).rounded(.up)))
+            let minutes = (expiresIn + 59) / 60
+            throw TwilioBridgeError.rateLimited("Rate limit: \(maxPerHour)/hour reached — oldest slot frees in ~\(minutes)m")
+        }
+    }
+
+    private func recordSend() {
+        let iso = ISO8601DateFormatter()
+        let now = Date()
+        let horizon = now.addingTimeInterval(-3600)
+
+        var state = loadRateState()
+        // Prune anything older than the horizon so the file doesn't grow without bound.
+        let pruned = state.sends.compactMap { iso.date(from: $0) }.filter { $0 > horizon }
+        state.sends = pruned.map { iso.string(from: $0) } + [iso.string(from: now)]
+        writeRateState(state)
+    }
 }
 
 // MARK: - Errors
@@ -285,6 +391,7 @@ enum TwilioBridgeError: LocalizedError {
     case missingConfig
     case noMessage
     case apiError(String)
+    case rateLimited(String)
 
     var errorDescription: String? {
         switch self {
@@ -293,6 +400,8 @@ enum TwilioBridgeError: LocalizedError {
         case .noMessage:
             return "No message to send (sendMessage not called)"
         case .apiError(let detail):
+            return detail
+        case .rateLimited(let detail):
             return detail
         }
     }

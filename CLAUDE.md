@@ -121,6 +121,59 @@ All bridges conform to `BridgeProtocol` (`findApp`, `sendMessage`, `waitForRespo
 - `Buck/Buck/BuckCoordinator.swift` — routes inbox requests to bridges by channel
 - `test-cursor-bridge.swift` — standalone Cursor test harness
 
+## buck-notify — SMS notifications via Twilio
+
+A separate CLI that sends SMS alerts to the user's phone via Buck's Twilio channel, and optionally waits for a reply SMS. Use this when Claude needs to reach the user who's away from the terminal.
+
+### Modes
+
+```bash
+# Fire-and-forget info push (e.g. "X task completed")
+"$HOME/Mac Projects/buck/buck-notify.sh" --info "Build passed, deploying..."
+
+# Ask a question and wait for an SMS reply (default timeout: 10 min)
+"$HOME/Mac Projects/buck/buck-notify.sh" --ask "Proceed with migration? (yes/no)"
+
+# Ask with a custom timeout (seconds)
+"$HOME/Mac Projects/buck/buck-notify.sh" --ask "Short question" --timeout 60
+```
+
+### Output
+
+```json
+{ "status": "sent|reply|error", "response": "..." }
+```
+
+- `status: sent` — info pushed (response = "sent").
+- `status: reply` — user replied; response body is the reply text verbatim.
+- `status: error` — timeout or API error.
+- If the user doesn't reply in time, the bridge forwards the question to the ChatGPT channel and returns `response: "[via=chatgpt_fallback] <answer>"`. Callers can detect fallback by the prefix.
+
+### Safety limits (enforced by the bridge)
+
+| Limit | Default | Override |
+|---|---|---|
+| Max message length | **480 chars** (3 SMS segments) | `max_message_length` in `~/.buck/twilio-config.json` |
+| Rate cap | **20 SMS per rolling hour** | `max_per_hour` |
+| Min interval between sends | **2 s** | `min_interval_sec` |
+
+**When calling `buck-notify.sh`:**
+- Keep messages under 480 chars. Messages that exceed it are truncated with a trailing `…` and logged — they do NOT error, but you'll lose the tail, so phrase the important bit first.
+- Do not fire notifications in tight loops. The 20/hour cap is persisted to `~/.buck/twilio-rate.json` and survives Buck restarts. A rate-limit violation returns `status: error` with a message telling you when the next slot frees.
+- Treat SMS as a scarce channel. Only use it for (a) task completion on long-running work, or (b) decisions that actually need the user. Never for progress chatter.
+
+### Timeouts
+
+- Bash tool timeout for `--info`: `timeout: 90000` (90 s) is plenty.
+- Bash tool timeout for `--ask`: set it to `(--timeout value + 60) * 1000` ms. Default ask is 600 s, so `timeout: 660000` ms. For tests with short custom timeouts, scale accordingly.
+- Never run `--ask` in the background — you need the reply to proceed.
+
+### Requirements
+
+- Twilio account (SID + auth token + from-number + to-number) in `~/.buck/twilio-config.json` (mode 600).
+- Buck.app running as menu bar app.
+- Twilio is outbound- and inbound-capable on the `from_number`.
+
 ## BuckSpeak — Voice I/O
 
 BuckSpeak is a separate local speak/listen tool. It does NOT use ChatGPT or `buck-review.sh`. It uses its own app (`BuckSpeak.app`) and IPC directories (`~/.buckspeak/`).
