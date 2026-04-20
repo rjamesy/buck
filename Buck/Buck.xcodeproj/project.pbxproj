@@ -19,6 +19,7 @@
 		AA000011 /* CursorBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000011; };
 		AA000012 /* BridgeProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000012; };
 		AA000013 /* CodexBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000013; };
+		AA000014 /* TwilioBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000014; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -35,6 +36,7 @@
 		AB000011 /* CursorBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CursorBridge.swift; sourceTree = "<group>"; };
 		AB000012 /* BridgeProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeProtocol.swift; sourceTree = "<group>"; };
 		AB000013 /* CodexBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexBridge.swift; sourceTree = "<group>"; };
+		AB000014 /* TwilioBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TwilioBridge.swift; sourceTree = "<group>"; };
 		AC000001 /* Buck.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Buck.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -66,6 +68,7 @@
 				AB000003 /* ChatGPTBridge.swift */,
 				AB000011 /* CursorBridge.swift */,
 				AB000013 /* CodexBridge.swift */,
+				AB000014 /* TwilioBridge.swift */,
 				AB000004 /* FileWatcher.swift */,
 				AB000005 /* ResponseWriter.swift */,
 				AB000006 /* Models.swift */,
@@ -168,6 +171,7 @@
 				AA000011 /* CursorBridge.swift in Sources */,
 				AA000012 /* BridgeProtocol.swift in Sources */,
 				AA000013 /* CodexBridge.swift in Sources */,
+				AA000014 /* TwilioBridge.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

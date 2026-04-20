@@ -53,6 +53,8 @@ class BuckCoordinator: ObservableObject {
         channels["cursor"] = ChannelState(bridge: CursorBridge())
         // Codex channel (direct OpenAI API — no desktop app needed)
         channels["codex"] = ChannelState(bridge: CodexBridge())
+        // Twilio SMS channel (notifications — no desktop app needed)
+        channels["twilio"] = ChannelState(bridge: TwilioBridge())
         checkAccessibility()
         startWatching()
     }
