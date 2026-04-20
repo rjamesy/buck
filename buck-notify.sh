@@ -98,8 +98,16 @@ fi
 # so Buck's compact-threshold logic (≥10 turns in rolling window) never triggers.
 SESSION_ID="$ID"
 
+# Tag the visible SMS body so Richard can tell at a glance whether a reply is
+# expected: INFO- (no reply needed) vs QUES- (reply requested).
+if [[ "$MODE" == "ask" ]]; then
+    TAGGED_MESSAGE="QUES-${MESSAGE}"
+else
+    TAGGED_MESSAGE="INFO-${MESSAGE}"
+fi
+
 # JSON-escape the message and prefix
-MESSAGE_ESCAPED=$(python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))" <<< "$MESSAGE")
+MESSAGE_ESCAPED=$(python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))" <<< "$TAGGED_MESSAGE")
 PROMPT_ESCAPED=$(python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))" <<< "$PROMPT_PREFIX")
 
 # Clear any stale response

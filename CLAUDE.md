@@ -149,6 +149,15 @@ A separate CLI that sends SMS alerts to the user's phone via Buck's Twilio chann
 - `status: error` — timeout or API error.
 - If the user doesn't reply in time, the bridge forwards the question to the ChatGPT channel and returns `response: "[via=chatgpt_fallback] <answer>"`. Callers can detect fallback by the prefix.
 
+### SMS body tags
+
+The outgoing SMS body is auto-prefixed so the user can tell at a glance whether a reply is expected:
+
+- `--info "<msg>"` → phone shows `INFO-<msg>` (no reply required)
+- `--ask  "<msg>"` → phone shows `QUES-<msg>` (reply requested)
+
+These 5-char prefixes count against the 480-char length cap. Keep the actual message ≤ 475 chars to avoid truncation.
+
 ### Safety limits (enforced by the bridge)
 
 | Limit | Default | Override |
