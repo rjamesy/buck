@@ -48,6 +48,19 @@ final class ResponseWriter {
             BuckLog.log("[laws] skipped: laws.txt empty")
             return response
         }
+
+        let failureDetected = detectFailure(in: response)
+        let banner = failureDetected ? """
+        ━━━ ⚠️  FAILURE DETECTED — META-RULE (not from the other AI) ━━━
+        Rule 0 triggers. Execute Rules 1 → 2 → 3 before any commit or next atomic.
+          1. Analyse data FIRST. Do not guess.
+          2. Simplify if complexity is the failure.
+          3. Iterate until simple, measurable, passing.
+        Write forensic analysis to disk. Do NOT advance.
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        """ : ""
+
         let footer = """
 
 
@@ -55,13 +68,40 @@ final class ResponseWriter {
         \(laws)
         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         """
+
+        if failureDetected {
+            BuckLog.log("[laws] FAILURE banner prepended to \(response.id)")
+        }
         BuckLog.log("[laws] injected footer (\(laws.count) chars) into \(response.id)")
+
         return ReviewResponse(
             id: response.id,
             timestamp: response.timestamp,
             status: response.status,
-            response: response.response + footer,
+            response: banner + response.response + footer,
             round: response.round
         )
+    }
+
+    /// Detect failure signals so we can prepend a strong directive banner.
+    /// Conservative on purpose: only high-confidence tokens. Lowercase "error"
+    /// / "failed" in casual prose is NOT a match — too noisy.
+    private static func detectFailure(in response: ReviewResponse) -> Bool {
+        if response.status == .error { return true }
+        let patterns = [
+            "\\bFAIL\\b",
+            "\\bFAILED\\b",
+            "\\bERROR\\b",
+            "\\bTest failed\\b",
+            "\\bAssertion failed\\b",
+            "\\bTimed out\\b"
+        ]
+        let text = response.response
+        for p in patterns {
+            if text.range(of: p, options: .regularExpression) != nil {
+                return true
+            }
+        }
+        return false
     }
 }
