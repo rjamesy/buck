@@ -202,7 +202,7 @@ final class ChatGPTBridge: BridgeProtocol {
 
     // MARK: - Wait for Response
 
-    func waitForResponse(timeout: TimeInterval = 120) async throws -> String {
+    func waitForResponse(timeout: TimeInterval = 600) async throws -> String {
         guard let app = appElement else {
             throw BuckError.chatGPTNotFound
         }
@@ -212,15 +212,12 @@ final class ChatGPTBridge: BridgeProtocol {
         var peakLength = 0
         var bestText = ""
         var gptStarted = false
-        var sendButtonGone = false  // true once send button disappeared (generation active)
-        var sendButtonBackCount = 0 // consecutive polls with send button visible after generation
-        var stableCount = 0
-        var lastStableText = ""
+        var sendButtonGone = false       // true once send button disappeared
+        var sendButtonBackCount = 0      // consecutive polls with send visible AND stop absent
         var groupStableWithSameText = 0
 
         enum SendButtonState { case visible, gone, unknown }
 
-        // Minimum wait before checking — gives GPT time to start
         try await Task.sleep(nanoseconds: 1_000_000_000)
 
         while Date() < deadline {
@@ -231,15 +228,17 @@ final class ChatGPTBridge: BridgeProtocol {
             let currentGroupCount = countMessageGroups()
             let currentLen = currentText.count
 
-            // Track send button state for completion detection (tri-state)
             let sendButtonState: SendButtonState
+            var stopButtonPresent = false
+            var census = "-"
             if let window = getFirstWindow(app) {
                 sendButtonState = findSendButton(in: window) != nil ? .visible : .gone
+                stopButtonPresent = findStopButton(in: window) != nil
+                census = buttonCensus(in: window)
             } else {
                 sendButtonState = .unknown
             }
 
-            // Only update send button tracking when we can actually inspect the window
             switch sendButtonState {
             case .gone:
                 if !sendButtonGone {
@@ -247,12 +246,11 @@ final class ChatGPTBridge: BridgeProtocol {
                     Self.log("Send button disappeared — generation active")
                 }
             case .unknown:
-                Self.log("poll: window uninspectable, skipping send button check")
+                Self.log("poll: window uninspectable, skipping button check")
             case .visible:
                 break
             }
 
-            // Detect GPT started: either group count increased or text changed
             if !gptStarted {
                 if currentGroupCount > initialGroupCount || currentText != initialText {
                     gptStarted = true
@@ -262,39 +260,37 @@ final class ChatGPTBridge: BridgeProtocol {
                 }
             }
 
-            // Skip empty/placeholder content
             if trimmed.isEmpty || trimmed == "\u{FFFC}" {
-                Self.log("poll: len=\(currentLen) peak=\(peakLength) (empty, skipping)")
+                Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) (empty, skipping)")
                 sendButtonBackCount = 0
                 continue
             }
 
-            // Skip if the text is identical to what was there before we sent
             if currentText == initialText {
-                if currentGroupCount > initialGroupCount {
+                let generationDone = sendButtonGone && !stopButtonPresent && sendButtonState == .visible
+                if currentGroupCount > initialGroupCount && generationDone {
                     groupStableWithSameText += 1
                     if groupStableWithSameText >= 3 {
-                        Self.log("Response identical to initial, groups confirm GPT responded")
+                        Self.log("Response identical to initial, groups + send-button confirm completion")
                         return currentText
                     }
-                    Self.log("poll: groups=\(currentGroupCount) text unchanged (\(groupStableWithSameText)/3)")
+                    Self.log("poll: groups=\(currentGroupCount) text unchanged (\(groupStableWithSameText)/3) census=\(census)")
                 } else {
                     sendButtonBackCount = 0
                     groupStableWithSameText = 0
+                    Self.log("poll: groups=\(currentGroupCount) text unchanged census=\(census) (generation active, not counting)")
                 }
                 continue
             }
             groupStableWithSameText = 0
 
-            // Detect GPT tool-use indicators (e.g. "Looked at Terminal • Focused on selected lines")
-            // GPT is still processing — real response hasn't arrived yet
             if isToolUseIndicator(trimmed) {
                 Self.log("poll: tool-use indicator, waiting for real response: \(trimmed.prefix(80))")
                 sendButtonBackCount = 0
                 continue
             }
 
-            // Track best text for timeout fallback
+            // bestText = forensic log only (never returned)
             if currentLen >= peakLength {
                 if currentLen > peakLength {
                     if let window = getFirstWindow(app) { expandAndScroll(in: window) }
@@ -303,61 +299,45 @@ final class ChatGPTBridge: BridgeProtocol {
                 bestText = currentText
             }
 
-            // Track text stability for completion detection
-            if currentText == lastStableText {
-                stableCount += 1
-            } else {
-                stableCount = 0
-                lastStableText = currentText
-            }
-
-            // Send button reappearance detection (requires 2 consecutive polls for debounce)
-            switch sendButtonState {
-            case .visible where sendButtonGone:
-                sendButtonBackCount += 1
-                Self.log("poll: len=\(currentLen) peak=\(peakLength) sendBtn=back(\(sendButtonBackCount)/2)")
-            case .gone:
+            // Send-button sovereign completion:
+            //   done iff sendButton visible AND stopButton absent for 3 consecutive polls.
+            if stopButtonPresent {
                 sendButtonBackCount = 0
-                Self.log("poll: len=\(currentLen) peak=\(peakLength) sendBtn=gone")
-            case .unknown:
-                // Don't advance or reset — uninspectable poll
-                Self.log("poll: len=\(currentLen) peak=\(peakLength) sendBtn=unknown")
-            case .visible:
-                // Send button still visible but sendButtonGone never set — generation hasn't started at UI level
-                Self.log("poll: len=\(currentLen) peak=\(peakLength) sendBtn=visible(pre-gen)")
+                Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) stopBtn=present (generating)")
+            } else {
+                switch sendButtonState {
+                case .visible where sendButtonGone:
+                    sendButtonBackCount += 1
+                    Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) sendBtn=back(\(sendButtonBackCount)/3)")
+                case .gone:
+                    sendButtonBackCount = 0
+                    Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) sendBtn=gone")
+                case .unknown:
+                    sendButtonBackCount = 0
+                    Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) sendBtn=unknown (reset)")
+                case .visible:
+                    Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) sendBtn=visible(pre-gen)")
+                }
             }
 
-            if sendButtonGone && sendButtonBackCount >= 2 {
-                // GPT finished — send button returned for 2 consecutive polls
+            if sendButtonGone && sendButtonBackCount >= 3 && !stopButtonPresent {
                 if let window = getFirstWindow(app) {
                     expandAndScroll(in: window)
                 }
-                let finalText = (try? readLastResponse()) ?? bestText
-                if !finalText.isEmpty && finalText != initialText && !isToolUseIndicator(finalText.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    Self.log("Response complete (send button returned), len=\(finalText.count)")
+                let finalText = (try? readLastResponse()) ?? ""
+                if !finalText.isEmpty
+                    && finalText != initialText
+                    && !isToolUseIndicator(finalText.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                    Self.log("Response complete (send button returned ≥3 polls, stop absent), len=\(finalText.count)")
                     return finalText
                 }
             }
-
-            // Text-stability completion: text non-empty, different from initial, stable for N polls
-            let stabilityThreshold = currentLen < 200 ? 3 : 4
-            if stableCount >= stabilityThreshold && currentText != initialText {
-                if let window = getFirstWindow(app) { expandAndScroll(in: window) }
-                let finalText = (try? readLastResponse()) ?? bestText
-                if !finalText.isEmpty && finalText != initialText {
-                    Self.log("Response complete (text stable \(stableCount) polls), len=\(finalText.count)")
-                    return finalText
-                }
-            }
-        }
-
-        // On timeout, return bestText if we got something substantial
-        if bestText.count > 0 {
-            Self.log("Timeout but returning best text, len=\(bestText.count) peak=\(peakLength)")
-            return bestText
         }
 
         Self.log("Timeout waiting for response (peak=\(peakLength))")
+        if !bestText.isEmpty {
+            Self.log("Timeout forensic bestText preview: \(bestText.prefix(200))")
+        }
         throw BridgeError.timeout
     }
 
@@ -490,13 +470,51 @@ final class ChatGPTBridge: BridgeProtocol {
     }
 
     private func findSendButton(in window: AXUIElement) -> AXUIElement? {
+        // Match by AXHelp only. Enabled-state can't distinguish "thinking" from
+        // "idle with empty input" — both are disabled. Use findStopButton presence
+        // as the authoritative "still generating" signal instead.
         return findElement(in: window, role: kAXButtonRole) { element in
-            var value: CFTypeRef?
-            AXUIElementCopyAttributeValue(element, kAXHelpAttribute as CFString, &value)
-            if let help = value as? String, help.contains("Send message") {
+            var helpVal: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXHelpAttribute as CFString, &helpVal)
+            if let help = helpVal as? String, help.contains("Send message") {
                 return true
             }
             return false
+        }
+    }
+
+    /// Detect ChatGPT's "Stop generating" / "Stop streaming" button.
+    /// Independent positive signal that generation is still in progress.
+    private func findStopButton(in window: AXUIElement) -> AXUIElement? {
+        return findElement(in: window, role: kAXButtonRole) { element in
+            let help = self.getStringAttribute(element, kAXHelpAttribute) ?? ""
+            let desc = self.getStringAttribute(element, kAXDescriptionAttribute) ?? ""
+            for needle in ["Stop generating", "Stop streaming"] {
+                if help.contains(needle) || desc.contains(needle) { return true }
+            }
+            return false
+        }
+    }
+
+    /// Per-poll debug: list help/description of buttons mentioning Send or Stop.
+    private func buttonCensus(in window: AXUIElement) -> String {
+        var hits: [String] = []
+        collectButtonCensus(window, into: &hits, depth: 0)
+        return hits.isEmpty ? "-" : hits.joined(separator: "|")
+    }
+
+    private func collectButtonCensus(_ element: AXUIElement, into hits: inout [String], depth: Int) {
+        if depth > 15 { return }
+        if getRole(element) == kAXButtonRole {
+            let help = getStringAttribute(element, kAXHelpAttribute) ?? ""
+            let desc = getStringAttribute(element, kAXDescriptionAttribute) ?? ""
+            let field = !help.isEmpty ? help : desc
+            if field.contains("Send") || field.contains("Stop") {
+                hits.append(field)
+            }
+        }
+        for child in getChildren(of: element) {
+            collectButtonCensus(child, into: &hits, depth: depth + 1)
         }
     }
 

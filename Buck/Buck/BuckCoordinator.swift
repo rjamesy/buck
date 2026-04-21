@@ -181,7 +181,7 @@ class BuckCoordinator: ObservableObject {
             BuckLog.log("[req:\(request.id)] Waiting for response")
             let responseText: String
             do {
-                responseText = try await bridge.waitForResponse(timeout: 120)
+                responseText = try await bridge.waitForResponse(timeout: 600)
             } catch BridgeError.timeout {
                 BuckLog.log("[req:\(request.id)] Timed out waiting for response")
                 throw BridgeError.timeout
