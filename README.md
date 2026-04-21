@@ -43,7 +43,7 @@ Claude Code / Codex                    Buck (menu bar)                   ChatGPT
    - Find the ChatGPT window
    - Set the text in the input field (AXValue on AXTextArea)
    - Press the Send button (AXPressAction on AXButton with AXHelp "Send message")
-   - Poll for GPT's response (text stability, send button state, message group count)
+   - Poll for GPT's response (send button visible + stop button absent for 3 consecutive polls = complete)
 5. **ResponseWriter** writes the response JSON to `~/.buck/outbox/`
 6. **buck-review.sh** polls the outbox, reads the response, and outputs it
 
@@ -106,10 +106,10 @@ Requires `"force-renderer-accessibility": true` in `~/.cursor/argv.json` (one-ti
 - **Menu bar app** — no dock icon, always running silently in the background
 - **Three AI targets** — ChatGPT (AXValue + button press, fully background), Cursor (brief activate + postToPid + auto-restore), and Codex (direct OpenAI API, no app needed)
 - **File-based IPC** — JSON in/out via `~/.buck/inbox/` and `~/.buck/outbox/`
-- **Smart response detection** — multiple heuristics to know when GPT is done:
-  - Text stability across consecutive polls
-  - Send button disappearance/reappearance (ChatGPT)
-  - Message group count changes (ChatGPT)
+- **Smart response detection** — send button is the authoritative signal for ChatGPT, plus defensive layers:
+  - Send button visible + stop button absent for 3 consecutive polls (ChatGPT)
+  - Never returns partial text on timeout — throws so callers see a clean error
+  - Message group count changes (ChatGPT — handles identical-text replies)
   - Bubble domId tracking (Cursor)
   - Tool-use indicator filtering ("Looked at Terminal", etc.)
 - **Automatic retry** — message send retries (3 attempts), shell script retries (configurable)
@@ -190,12 +190,15 @@ Cursor Window
 
 ### Response Detection
 
-The hardest problem Buck solves: knowing when the AI is done generating. It uses three independent signals:
+The hardest problem Buck solves: knowing when the AI is done generating.
 
-**ChatGPT:**
-1. **Text stability** — response text unchanged for 3–4 consecutive polls (2s interval)
-2. **Send button cycle** — button disappears (generation active) then reappears for 2 consecutive polls
-3. **Identical response with new groups** — handles repeated responses by checking message group count
+**ChatGPT — send-button sovereignty (the only completion signal):**
+1. **Send button cycle** — button disappears (generation starts), stop button appears, then send button reappears AND stop button disappears for 3 consecutive polls = done
+2. **Stop button positive check** — resets the send-button counter while generation is active; guards against phase-transition flicker
+3. **Identical response with new groups** — handles the rare case where GPT's reply is byte-identical to the previous message; only counts when send-button sovereignty also holds
+4. **Timeout throws** — on deadline, the bridge throws `BridgeError.timeout` rather than returning partial text, so callers never silently consume a truncated reply
+
+Text stability was previously a completion signal but was removed — mid-stream GPT pauses (thinking, large context, slow networks) would trigger false completions.
 
 **Cursor:**
 1. **Text stability** — last bubble text unchanged for 3–4 consecutive polls
@@ -486,6 +489,7 @@ These are natural language triggers from the global CLAUDE.md instructions, not 
 | `~/.buck/logs/buck.log` | Debug log (Buck + CursorBridge) |
 | `~/.buck/history.db` | SQLite session history (7-day retention) |
 | `~/.buck/codex-config.json` | Codex bridge config (API key + model) |
+| `~/.buck/laws.txt` | LAWS reminder text auto-appended to every outbox response (missing = no-op) |
 | `~/.buckspeak/inbox/` | BuckSpeak IPC requests |
 | `~/.buckspeak/outbox/` | BuckSpeak IPC responses |
 | `~/.buckteams/chat.jsonl` | BuckTeams chat log (NDJSON) |
@@ -493,6 +497,31 @@ These are natural language triggers from the global CLAUDE.md instructions, not 
 | `~/.buckteams/participants/` | BuckTeams presence/status files |
 | `~/.buckteams/codex-config.json` | BuckTeams API key for GPT + Codex bridges |
 | `~/.buckteams/inbox/` | BuckTeams ping files for agent wake signals |
+
+## LAWS Reminder Injection
+
+Buck auto-appends the contents of `~/.buck/laws.txt` to every outbox response. This keeps AI-authored rules in the requesting agent's working context at every tool-return boundary, defeating long-session drift without depending on the agent remembering to check its system prompt.
+
+```
+<GPT's response>
+
+━━━ LAWS REMINDER (not from the other AI) ━━━
+<laws.txt contents>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Setup:
+```bash
+cat > ~/.buck/laws.txt <<'LAWS'
+Rule 1 — ...
+Rule 2 — ...
+Rule 3 — ...
+LAWS
+```
+
+- File missing or empty → no footer, no error (backward-compatible)
+- `BUCK_LAWS_OFF=1` on the Buck.app process → hard-disables injection
+- Log sink: `~/.buck/logs/buck.log` records `[laws] injected` / `[laws] skipped` per response
 
 ## Requirements
 
