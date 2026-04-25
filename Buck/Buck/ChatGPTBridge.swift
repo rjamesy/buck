@@ -207,17 +207,15 @@ final class ChatGPTBridge: BridgeProtocol {
             throw BuckError.chatGPTNotFound
         }
         let initialText = (try? readLastResponse()) ?? ""
-        let initialGroupCount = countMessageGroups()
         let deadline = Date().addingTimeInterval(timeout)
         var peakLength = 0
         var bestText = ""
-        var gptStarted = false
-        var sendButtonGone = false       // true once send button disappeared
-        var sendButtonBackCount = 0      // consecutive polls with send visible AND stop absent
-        var groupStableWithSameText = 0
+        // Sticky flags: once true, stay true for the rest of the wait.
+        // Either is sufficient evidence that GPT actually responded.
+        var stopEverObserved = false
+        var textEverChanged = false
 
-        enum SendButtonState { case visible, gone, unknown }
-
+        // Initial wait so the click registers and ChatGPT begins rendering.
         try await Task.sleep(nanoseconds: 1_000_000_000)
 
         while Date() < deadline {
@@ -225,112 +223,71 @@ final class ChatGPTBridge: BridgeProtocol {
 
             let currentText = (try? readLastResponse()) ?? ""
             let trimmed = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
-            let currentGroupCount = countMessageGroups()
             let currentLen = currentText.count
 
-            let sendButtonState: SendButtonState
-            var stopButtonPresent = false
-            var census = "-"
-            if let window = getFirstWindow(app) {
-                sendButtonState = findSendButton(in: window) != nil ? .visible : .gone
-                stopButtonPresent = findStopButton(in: window) != nil
-                census = buttonCensus(in: window)
-            } else {
-                sendButtonState = .unknown
-            }
-
-            switch sendButtonState {
-            case .gone:
-                if !sendButtonGone {
-                    sendButtonGone = true
-                    Self.log("Send button disappeared — generation active")
-                }
-            case .unknown:
-                Self.log("poll: window uninspectable, skipping button check")
-            case .visible:
-                break
-            }
-
-            if !gptStarted {
-                if currentGroupCount > initialGroupCount || currentText != initialText {
-                    gptStarted = true
-                    Self.log("GPT started responding, groups=\(currentGroupCount) (was \(initialGroupCount))")
-                } else {
-                    continue
-                }
-            }
-
-            if trimmed.isEmpty || trimmed == "\u{FFFC}" {
-                Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) (empty, skipping)")
-                sendButtonBackCount = 0
+            guard let window = getFirstWindow(app) else {
+                Self.log("poll: window uninspectable")
                 continue
             }
+            let sendButtonPresent = findSendButton(in: window) != nil
+            let stopButtonPresent = findStopButton(in: window) != nil
+            let census = buttonCensus(in: window)
 
-            if currentText == initialText {
-                let generationDone = sendButtonGone && !stopButtonPresent && sendButtonState == .visible
-                if currentGroupCount > initialGroupCount && generationDone {
-                    groupStableWithSameText += 1
-                    if groupStableWithSameText >= 3 {
-                        Self.log("Response identical to initial, groups + send-button confirm completion")
-                        return currentText
-                    }
-                    Self.log("poll: groups=\(currentGroupCount) text unchanged (\(groupStableWithSameText)/3) census=\(census)")
-                } else {
-                    sendButtonBackCount = 0
-                    groupStableWithSameText = 0
-                    Self.log("poll: groups=\(currentGroupCount) text unchanged census=\(census) (generation active, not counting)")
-                }
-                continue
-            }
-            groupStableWithSameText = 0
-
-            if isToolUseIndicator(trimmed) {
-                Self.log("poll: tool-use indicator, waiting for real response: \(trimmed.prefix(80))")
-                sendButtonBackCount = 0
-                continue
-            }
-
-            // bestText = forensic log only (never returned)
-            if currentLen >= peakLength {
-                if currentLen > peakLength {
-                    if let window = getFirstWindow(app) { expandAndScroll(in: window) }
-                }
+            // Forensic peak tracking (logging only — never returned)
+            if currentLen > peakLength {
+                expandAndScroll(in: window)
                 peakLength = currentLen
                 bestText = currentText
             }
 
-            // Send-button sovereign completion:
-            //   done iff sendButton visible AND stopButton absent for 3 consecutive polls.
-            if stopButtonPresent {
-                sendButtonBackCount = 0
-                Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) stopBtn=present (generating)")
-            } else {
-                switch sendButtonState {
-                case .visible where sendButtonGone:
-                    sendButtonBackCount += 1
-                    Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) sendBtn=back(\(sendButtonBackCount)/3)")
-                case .gone:
-                    sendButtonBackCount = 0
-                    Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) sendBtn=gone")
-                case .unknown:
-                    sendButtonBackCount = 0
-                    Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) sendBtn=unknown (reset)")
-                case .visible:
-                    Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) sendBtn=visible(pre-gen)")
-                }
+            // Update sticky flags on every poll.
+            if stopButtonPresent && !stopEverObserved {
+                stopEverObserved = true
+                Self.log("Sticky: stop button observed — generation confirmed")
+            }
+            if currentText != initialText && !textEverChanged {
+                textEverChanged = true
+                Self.log("Sticky: text changed from initial — generation confirmed")
             }
 
-            if sendButtonGone && sendButtonBackCount >= 3 && !stopButtonPresent {
-                if let window = getFirstWindow(app) {
-                    expandAndScroll(in: window)
-                }
-                let finalText = (try? readLastResponse()) ?? ""
-                if !finalText.isEmpty
-                    && finalText != initialText
-                    && !isToolUseIndicator(finalText.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    Self.log("Response complete (send button returned ≥3 polls, stop absent), len=\(finalText.count)")
-                    return finalText
-                }
+            // Still generating: primary button is in stop state.
+            if stopButtonPresent {
+                Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) stopBtn=present (generating)")
+                continue
+            }
+
+            // Mid-render: button might be transiently neither send nor stop.
+            if !sendButtonPresent {
+                Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) sendBtn=missing (waiting)")
+                continue
+            }
+
+            // Idle (Send visible, no Stop). Did GPT actually respond?
+            // Need at least one positive signal: either Stop was seen, or text changed.
+            if !(stopEverObserved || textEverChanged) {
+                Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) idle but no signal yet (waiting)")
+                continue
+            }
+
+            // Empty / object-replacement char: still rendering.
+            if trimmed.isEmpty || trimmed == "\u{FFFC}" {
+                Self.log("poll: len=\(currentLen) peak=\(peakLength) census=\(census) (empty)")
+                continue
+            }
+
+            // Tool-use indicator ("Looked at Terminal" etc.) — real reply not yet present.
+            if isToolUseIndicator(trimmed) {
+                Self.log("poll: tool-use indicator, waiting for real response: \(trimmed.prefix(80))")
+                continue
+            }
+
+            // Completion: idle button state + at least one positive signal + real text.
+            expandAndScroll(in: window)
+            let finalText = (try? readLastResponse()) ?? ""
+            if !finalText.isEmpty
+                && !isToolUseIndicator(finalText.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                Self.log("Response complete (stopSeen=\(stopEverObserved) textChanged=\(textEverChanged)), len=\(finalText.count)")
+                return finalText
             }
         }
 
@@ -469,31 +426,37 @@ final class ChatGPTBridge: BridgeProtocol {
         }
     }
 
-    private func findSendButton(in window: AXUIElement) -> AXUIElement? {
-        // Match by AXHelp only. Enabled-state can't distinguish "thinking" from
-        // "idle with empty input" — both are disabled. Use findStopButton presence
-        // as the authoritative "still generating" signal instead.
+    /// Stable AXIdentifier for ChatGPT's primary action button.
+    /// Same physical element morphs between Send and Stop during generation;
+    /// the identifier survives the morph, so we can target the exact button
+    /// rather than searching the tree for any "Send"-labelled element.
+    private static let primaryButtonAXIdentifier = "MessageInputPrimaryButtonContainerPart.PrimaryButton"
+
+    /// Locate the morphing primary action button by its stable AXIdentifier.
+    /// Single deterministic lookup; replaces the tree-wide AXHelp string match.
+    private func findPrimaryButton(in window: AXUIElement) -> AXUIElement? {
         return findElement(in: window, role: kAXButtonRole) { element in
-            var helpVal: CFTypeRef?
-            AXUIElementCopyAttributeValue(element, kAXHelpAttribute as CFString, &helpVal)
-            if let help = helpVal as? String, help.contains("Send message") {
-                return true
-            }
-            return false
+            let id = self.getStringAttribute(element, "AXIdentifier") ?? ""
+            return id == Self.primaryButtonAXIdentifier
         }
     }
 
-    /// Detect ChatGPT's "Stop generating" / "Stop streaming" button.
-    /// Independent positive signal that generation is still in progress.
+    /// Returns the primary button iff it is currently in "Send" state.
+    private func findSendButton(in window: AXUIElement) -> AXUIElement? {
+        guard let btn = findPrimaryButton(in: window) else { return nil }
+        let help = getStringAttribute(btn, kAXHelpAttribute) ?? ""
+        return help.contains("Send message") ? btn : nil
+    }
+
+    /// Returns the primary button iff it is currently NOT in Send state.
+    /// We treat any non-Send label as stop-equivalent — covers "Stop generating",
+    /// "Stop streaming", "Cancel", "Pause", or any future ChatGPT label change
+    /// without needing to enumerate. Independent positive signal that generation
+    /// is in progress.
     private func findStopButton(in window: AXUIElement) -> AXUIElement? {
-        return findElement(in: window, role: kAXButtonRole) { element in
-            let help = self.getStringAttribute(element, kAXHelpAttribute) ?? ""
-            let desc = self.getStringAttribute(element, kAXDescriptionAttribute) ?? ""
-            for needle in ["Stop generating", "Stop streaming"] {
-                if help.contains(needle) || desc.contains(needle) { return true }
-            }
-            return false
-        }
+        guard let btn = findPrimaryButton(in: window) else { return nil }
+        let help = getStringAttribute(btn, kAXHelpAttribute) ?? ""
+        return help.contains("Send message") ? nil : btn
     }
 
     /// Per-poll debug: list help/description of buttons mentioning Send or Stop.
