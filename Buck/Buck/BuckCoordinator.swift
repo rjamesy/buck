@@ -27,6 +27,19 @@ class BuckCoordinator: ObservableObject {
     private var channels: [String: ChannelState] = [:]
     private let channelLock = NSLock()
 
+    // Cross-channel ChatGPT app lock. Channels "a" and "b" both bind ChatGPTBridge
+    // to the same ChatGPT.app process and share its window-global send/stop button
+    // signals (used by waitForResponse since fd31ba8). Without this lock, two
+    // concurrent callers on different channels race on the same button cycle and
+    // pick up each other's responses.
+    //
+    // LOCK ORDER (must be uniform across handleInboxFile, handleCompact, forward):
+    //   1. chatgptAppLock.tryLock()  — acquired FIRST  for ChatGPT-targeting channels
+    //   2. channelLock.lock()        — acquired SECOND for per-channel state
+    // Releases run in reverse order naturally via Swift LIFO defer.
+    private let chatgptAppLock = NSLock()
+    private static let chatgptChannels: Set<String> = ["a", "b"]
+
     private static func mapCaller(_ raw: String?) -> CallerID {
         switch raw?.trimmingCharacters(in: .whitespaces).lowercased() {
         case "claude": return .claude
@@ -121,9 +134,27 @@ class BuckCoordinator: ObservableObject {
             return
         }
 
-        // Handle compact requests — separate flow
+        // Cross-channel ChatGPT app lock — see chatgptAppLock declaration for rationale.
+        let needsAppLock = Self.chatgptChannels.contains(channelName)
+        if needsAppLock && !chatgptAppLock.try() {
+            BuckLog.log("[req:\(request.id)] Rejected — ChatGPT app busy on another channel")
+            let response = ReviewResponse(
+                id: request.id,
+                timestamp: ISO8601DateFormatter().string(from: Date()),
+                status: .error,
+                response: "Another message is in flight",
+                round: 1
+            )
+            try? writer.write(response)
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        defer { if needsAppLock { chatgptAppLock.unlock() } }
+
+        // Handle compact requests — separate flow.
+        // appLockAlreadyHeld:true so handleCompact doesn't double-acquire (NSLock is not recursive).
         if request.content.hasPrefix("[COMPACT_SESSION]") {
-            await handleCompact(request: request, channel: channelName, url: url)
+            await handleCompact(request: request, channel: channelName, url: url, appLockAlreadyHeld: needsAppLock)
             return
         }
 
@@ -241,7 +272,25 @@ class BuckCoordinator: ObservableObject {
 
     // MARK: - Session Compact
 
-    private func handleCompact(request: ReviewRequest, channel channelName: String, url: URL) async {
+    private func handleCompact(request: ReviewRequest, channel channelName: String, url: URL, appLockAlreadyHeld: Bool = false) async {
+        // Cross-channel ChatGPT app lock (skip if caller already holds it).
+        // See chatgptAppLock declaration for rationale and uniform lock order.
+        let needsAppLock = Self.chatgptChannels.contains(channelName) && !appLockAlreadyHeld
+        if needsAppLock && !chatgptAppLock.try() {
+            BuckLog.log("[req:\(request.id)] Compact rejected — ChatGPT app busy on another channel")
+            let response = ReviewResponse(
+                id: request.id,
+                timestamp: ISO8601DateFormatter().string(from: Date()),
+                status: .error,
+                response: "Another message is in flight",
+                round: 1
+            )
+            try? writer.write(response)
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        defer { if needsAppLock { chatgptAppLock.unlock() } }
+
         channelLock.lock()
         if channels[channelName]!.isProcessing {
             channelLock.unlock()
@@ -334,6 +383,14 @@ class BuckCoordinator: ObservableObject {
     // Callers must NOT already hold the target channel's lock — that would
     // deadlock. Cross-channel calls are fine (twilio → a).
     func forward(to channelName: String, prompt: String, timeout: TimeInterval) async throws -> String {
+        // Cross-channel ChatGPT app lock — acquired BEFORE channelLock to honour
+        // uniform lock order (see chatgptAppLock declaration).
+        let needsAppLock = Self.chatgptChannels.contains(channelName)
+        if needsAppLock && !chatgptAppLock.try() {
+            throw TwilioBridgeError.apiError("Forward target channel \(channelName) is busy (ChatGPT app held by another channel)")
+        }
+        defer { if needsAppLock { chatgptAppLock.unlock() } }
+
         channelLock.lock()
         guard channels[channelName] != nil else {
             channelLock.unlock()
