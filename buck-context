@@ -133,6 +133,22 @@ CREATE TABLE IF NOT EXISTS memories_audit (
 );
 """
 
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS archives (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    project          TEXT REFERENCES projects(path) ON DELETE CASCADE,
+    title            TEXT,
+    summary          TEXT,
+    created_at       TEXT NOT NULL,
+    raw_bytes        INTEGER NOT NULL,
+    compressed_bytes INTEGER NOT NULL,
+    compression      TEXT NOT NULL DEFAULT 'zlib',
+    blob             BLOB NOT NULL,
+    metadata_json    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_archives_project_time ON archives(project, created_at);
+"""
+
 
 def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -148,6 +164,10 @@ def migrate(conn: sqlite3.Connection) -> None:
     if version < 1:
         conn.executescript(SCHEMA_V1)
         conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+    if version < 2:
+        conn.executescript(SCHEMA_V2)
+        conn.execute("PRAGMA user_version = 2")
         conn.commit()
 
 
@@ -643,6 +663,330 @@ def cmd_menu(args: argparse.Namespace) -> None:
             print(f"             $ {o['command']}")
 
 
+# ---------- compression for archives (STRATA primary, zlib fallback) ----------
+
+STRATA_DIR = Path.home() / "AI_Projects" / "STRATA"
+
+
+def _load_strata():
+    """Dynamically import the user's STRATA module if present.
+    Returns the module or None when unavailable / broken."""
+    try:
+        if not (STRATA_DIR / "strata.py").exists():
+            return None
+        if str(STRATA_DIR) not in sys.path:
+            sys.path.insert(0, str(STRATA_DIR))
+        import importlib
+        m = importlib.import_module("strata")
+        # Sanity check the API surface we depend on.
+        if not (callable(getattr(m, "compress", None))
+                and callable(getattr(m, "decompress", None))):
+            return None
+        return m
+    except Exception:
+        return None
+
+
+def _compress(data: bytes) -> tuple[bytes, str]:
+    """Compress `data` using STRATA when available, zlib otherwise.
+    Returns (blob, compression_scheme) where scheme ∈ {'strata','zlib'}."""
+    m = _load_strata()
+    if m is not None:
+        try:
+            return m.compress(data), "strata"
+        except Exception:
+            pass  # fall through to zlib
+    import zlib
+    return zlib.compress(data, 9), "zlib"
+
+
+def _decompress(blob: bytes, scheme: str) -> bytes:
+    if scheme == "strata":
+        m = _load_strata()
+        if m is None:
+            raise RuntimeError("archive uses STRATA but strata.py not available")
+        return m.decompress(blob)
+    if scheme == "zlib":
+        import zlib
+        return zlib.decompress(blob)
+    if scheme == "none":
+        return blob
+    raise RuntimeError(f"unknown compression scheme: {scheme!r}")
+
+
+# ---------- archive payload format ----------
+#
+# A single JSON object, serialised UTF-8, then compressed:
+#   {
+#     "version": 1,
+#     "project": "<abspath>",
+#     "title": "<user title>",
+#     "created_at": "<iso>",
+#     "memories":  [ {category,key,content,importance,expires_at,created_at,updated_at}, ... ],
+#     "messages":  [ {request_id,agent,direction,channel,status,content,
+#                     tokens_in,tokens_out,timestamp}, ... ],
+#     "metadata":  { "memory_count": N, "message_count": M, ... }
+#   }
+# IDs are stripped to keep restore additive (new ids assigned on insert).
+
+
+def _build_archive_payload(conn: sqlite3.Connection, proj: str,
+                           include_messages: int) -> dict:
+    p = conn.execute("SELECT * FROM projects WHERE path = ?", (proj,)).fetchone()
+    if not p:
+        die(f"project not registered: {proj}")
+    mem_rows = conn.execute(
+        "SELECT category,key,content,importance,expires_at,created_at,updated_at "
+        "FROM memories WHERE project = ? ORDER BY importance DESC, updated_at DESC",
+        (proj,),
+    ).fetchall()
+    msg_rows = conn.execute(
+        "SELECT request_id,agent,direction,channel,status,content,tokens_in,tokens_out,timestamp "
+        "FROM messages WHERE project = ? ORDER BY id ASC",
+        (proj,),
+    ).fetchall()
+    if include_messages > 0:
+        msg_rows = msg_rows[-include_messages:] if include_messages else msg_rows
+    elif include_messages == 0:
+        msg_rows = []
+    payload = {
+        "version": 1,
+        "project": proj,
+        "title": p["title"],
+        "created_at": now_iso(),
+        "memories": [dict(r) for r in mem_rows],
+        "messages": [dict(r) for r in msg_rows],
+        "metadata": {
+            "memory_count": len(mem_rows),
+            "message_count": len(msg_rows),
+            "summary": p["summary"] or "",
+        },
+    }
+    return payload
+
+
+def cmd_archive(args: argparse.Namespace) -> None:
+    proj = resolve_project(args.session)
+    conn = connect(); migrate(conn)
+    payload = _build_archive_payload(
+        conn, proj,
+        include_messages=args.messages if args.messages is not None else 200,
+    )
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    blob, scheme = _compress(raw)
+
+    title = args.title or f"snapshot {now_iso()}"
+    summary = (f"{payload['metadata']['memory_count']} memories, "
+               f"{payload['metadata']['message_count']} messages")
+
+    cur = conn.execute(
+        """
+        INSERT INTO archives
+            (project, title, summary, created_at, raw_bytes, compressed_bytes,
+             compression, blob, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (proj, title, summary, now_iso(), len(raw), len(blob),
+         scheme, blob, json.dumps(payload["metadata"])),
+    )
+    arc_id = cur.lastrowid
+    conn.commit()
+
+    if args.json:
+        json.dump({"id": arc_id, "compression": scheme, "raw_bytes": len(raw),
+                   "compressed_bytes": len(blob),
+                   "ratio": round(len(blob) / max(len(raw), 1), 3)},
+                  sys.stdout, indent=2); sys.stdout.write("\n")
+    else:
+        ratio = len(blob) / max(len(raw), 1)
+        print(f"archive id={arc_id}  scheme={scheme}  "
+              f"raw={len(raw):,} → {len(blob):,} bytes  "
+              f"({ratio:.1%} of raw)  title={title!r}")
+
+
+def cmd_archives(args: argparse.Namespace) -> None:
+    conn = connect(); migrate(conn)
+    if args.action == "list":
+        proj = resolve_project(args.session)
+        rows = conn.execute(
+            "SELECT id, created_at, compression, raw_bytes, compressed_bytes, "
+            "title, summary FROM archives WHERE project = ? "
+            "ORDER BY id DESC", (proj,),
+        ).fetchall()
+        if not args.json:
+            rows = [dict(r) for r in rows]
+            for r in rows:
+                r["size_kb"] = f"{r['compressed_bytes']/1024:.1f}"
+        emit(rows, args.json,
+             ["id", "created_at", "compression", "size_kb", "title", "summary"]
+             if not args.json else None)
+        return
+
+    if args.action == "view":
+        row = conn.execute(
+            "SELECT * FROM archives WHERE id = ?", (args.id,)
+        ).fetchone()
+        if not row:
+            die(f"no archive id={args.id}")
+        try:
+            raw = _decompress(row["blob"], row["compression"])
+        except Exception as e:
+            die(f"decompress failed: {e}")
+        if args.raw:
+            sys.stdout.write(raw.decode("utf-8", errors="replace"))
+            return
+        # Pretty-render as markdown.
+        payload = json.loads(raw)
+        out = [f"# Archive #{row['id']} — {row['title']}",
+               f"_project: {row['project']}_   _created: {row['created_at']}_",
+               f"_compression: {row['compression']}  raw={row['raw_bytes']:,}B  "
+               f"compressed={row['compressed_bytes']:,}B_",
+               ""]
+        if payload.get("metadata", {}).get("summary"):
+            out.append(f"**Summary.** {payload['metadata']['summary']}\n")
+        if payload.get("memories"):
+            out.append("## Memories")
+            for m in payload["memories"]:
+                tag = f" `[{m['key']}]`" if m.get("key") else ""
+                out.append(f"- _{m['category']}_  {m['content']}{tag}  "
+                           f"_(imp {m['importance']})_")
+        if payload.get("messages"):
+            out.append("\n## Messages tail")
+            for m in payload["messages"][-50:]:
+                arrow = "→" if m["direction"] == "out" else "←"
+                preview = (m.get("content") or "").replace("\n", " ")[:100]
+                out.append(f"- {m['timestamp']} {arrow} {m['agent']} "
+                           f"{('('+m['status']+')') if m.get('status') else ''} {preview}")
+        print("\n".join(out))
+        return
+
+    if args.action == "restore":
+        row = conn.execute(
+            "SELECT * FROM archives WHERE id = ?", (args.id,)
+        ).fetchone()
+        if not row:
+            die(f"no archive id={args.id}")
+        try:
+            raw = _decompress(row["blob"], row["compression"])
+        except Exception as e:
+            die(f"decompress failed: {e}")
+        payload = json.loads(raw)
+        target = expand_path(args.into_project) if args.into_project else row["project"]
+        ensure_project(conn, target)
+        n_mem = 0; n_msg = 0
+        for m in payload.get("memories", []):
+            cur = conn.execute(
+                """
+                INSERT INTO memories
+                    (project, category, key, content, importance, expires_at,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (target, m["category"], m.get("key"), m["content"],
+                 int(m.get("importance", 5)), m.get("expires_at"),
+                 m.get("created_at") or now_iso(), m.get("updated_at") or now_iso()),
+            )
+            conn.execute(
+                "INSERT INTO memories_audit (memory_id, action, content_before, "
+                "content_after, timestamp) VALUES (?, 'create', NULL, ?, ?)",
+                (cur.lastrowid, m["content"], now_iso()))
+            n_mem += 1
+        if not args.no_messages:
+            for ms in payload.get("messages", []):
+                conn.execute(
+                    """
+                    INSERT INTO messages
+                        (project, request_id, agent, direction, channel, status,
+                         content, tokens_in, tokens_out, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (target, ms.get("request_id"), ms["agent"], ms["direction"],
+                     ms.get("channel"), ms.get("status"), ms["content"],
+                     ms.get("tokens_in"), ms.get("tokens_out"),
+                     ms.get("timestamp") or now_iso()))
+                n_msg += 1
+        conn.commit()
+        if args.json:
+            json.dump({"restored_to": target, "memories": n_mem,
+                       "messages": n_msg}, sys.stdout); sys.stdout.write("\n")
+        else:
+            print(f"restored archive #{args.id} into {target}: "
+                  f"{n_mem} memories, {n_msg} messages")
+        return
+
+    if args.action == "delete":
+        row = conn.execute("SELECT id FROM archives WHERE id = ?",
+                           (args.id,)).fetchone()
+        if not row:
+            die(f"no archive id={args.id}")
+        conn.execute("DELETE FROM archives WHERE id = ?", (args.id,))
+        conn.commit()
+        if args.json:
+            json.dump({"id": args.id, "deleted": True}, sys.stdout); sys.stdout.write("\n")
+        else:
+            print(f"deleted archive id={args.id}")
+        return
+
+    if args.action == "export":
+        row = conn.execute("SELECT * FROM archives WHERE id = ?",
+                           (args.id,)).fetchone()
+        if not row:
+            die(f"no archive id={args.id}")
+        import base64
+        envelope = {
+            "magic": "BUCKCTX1",
+            "version": 1,
+            "project": row["project"],
+            "title": row["title"],
+            "summary": row["summary"],
+            "created_at": row["created_at"],
+            "compression": row["compression"],
+            "raw_bytes": row["raw_bytes"],
+            "compressed_bytes": row["compressed_bytes"],
+            "metadata": json.loads(row["metadata_json"] or "{}"),
+            "blob_b64": base64.b64encode(row["blob"]).decode("ascii"),
+        }
+        # Write to stdout (binary-safe — base64-encoded blob).
+        sys.stdout.write(json.dumps(envelope, indent=2))
+        sys.stdout.write("\n")
+        return
+
+    if args.action == "import":
+        import base64
+        data = sys.stdin.read()
+        try:
+            envelope = json.loads(data)
+        except json.JSONDecodeError as e:
+            die(f"import: input is not valid JSON: {e}")
+        if envelope.get("magic") != "BUCKCTX1":
+            die("import: missing or wrong BUCKCTX1 magic")
+        target = expand_path(args.into_project) if args.into_project \
+                 else envelope["project"]
+        ensure_project(conn, target)
+        blob = base64.b64decode(envelope["blob_b64"])
+        cur = conn.execute(
+            """
+            INSERT INTO archives
+                (project, title, summary, created_at, raw_bytes,
+                 compressed_bytes, compression, blob, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (target, envelope.get("title"), envelope.get("summary"),
+             envelope.get("created_at") or now_iso(),
+             envelope["raw_bytes"], envelope["compressed_bytes"],
+             envelope["compression"], blob,
+             json.dumps(envelope.get("metadata", {}))),
+        )
+        conn.commit()
+        if args.json:
+            json.dump({"id": cur.lastrowid, "project": target}, sys.stdout); sys.stdout.write("\n")
+        else:
+            print(f"imported archive id={cur.lastrowid} into {target}")
+        return
+
+    die(f"unknown archives action: {args.action}")
+
+
 def _chunk_for_push(text: str, limit: int) -> list[str]:
     """Split `text` on paragraph (\\n\\n) boundaries into chunks of <= `limit`
     chars. If a paragraph exceeds `limit` it gets hard-cut at character
@@ -1003,6 +1347,43 @@ def build_parser() -> argparse.ArgumentParser:
     ssp.add_argument("path", help="project path or unique substring")
     ssp.add_argument("--max", type=int, default=20)
     ssp.set_defaults(func=cmd_sessions)
+
+    sp = sub.add_parser("archive", parents=[common],
+                        help="snapshot project memories+messages into a compressed archive")
+    sp.add_argument("--title", help="user title for the snapshot")
+    sp.add_argument("--messages", type=int, default=200,
+                    help="how many recent messages to include (-1 = all, 0 = none, default 200)")
+    sp.add_argument("--session", help="project (default: CWD)")
+    sp.set_defaults(func=cmd_archive)
+
+    sp = sub.add_parser("archives", parents=[common],
+                        help="manage archive snapshots: list / view / restore / delete / export / import")
+    asub = sp.add_subparsers(dest="action", required=True)
+    a = asub.add_parser("list", parents=[common])
+    a.add_argument("--session", help="project (default: CWD)")
+    a.set_defaults(func=cmd_archives)
+    a = asub.add_parser("view", parents=[common])
+    a.add_argument("id", type=int)
+    a.add_argument("--raw", action="store_true",
+                   help="emit decompressed JSON payload as-is")
+    a.set_defaults(func=cmd_archives)
+    a = asub.add_parser("restore", parents=[common])
+    a.add_argument("id", type=int)
+    a.add_argument("--into-project", dest="into_project",
+                   help="target project path (default: archive's original project)")
+    a.add_argument("--no-messages", dest="no_messages", action="store_true",
+                   help="restore memories only, skip messages")
+    a.set_defaults(func=cmd_archives)
+    a = asub.add_parser("delete", parents=[common])
+    a.add_argument("id", type=int)
+    a.set_defaults(func=cmd_archives)
+    a = asub.add_parser("export", parents=[common])
+    a.add_argument("id", type=int)
+    a.set_defaults(func=cmd_archives)
+    a = asub.add_parser("import", parents=[common])
+    a.add_argument("--into-project", dest="into_project",
+                   help="target project path (default: from envelope)")
+    a.set_defaults(func=cmd_archives)
 
     sp = sub.add_parser("push-gpt", parents=[common],
                         help="deliver recap to a GPT session in chunked READY/ACK/LOADED handoff")
