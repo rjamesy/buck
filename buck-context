@@ -1166,6 +1166,269 @@ def _attempt_with_retries(content: str, expected: str, channel: str,
     return False
 
 
+# ---------- selective Ollama compaction (L6) ----------
+
+OLLAMA_URL_DEFAULT = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+COMPACT_MODEL_DEFAULT = "qwen2.5:7b-instruct"
+
+# Char budget per chunk fed to Ollama. Rough rule-of-thumb: ~3.5 chars / token,
+# qwen2.5:7b context is 32k tokens, leave ~4k tokens for prompt scaffold +
+# response → 28k usable tokens × 3.5 ≈ 98k chars. Use a conservative 80k.
+COMPACT_CHUNK_CHARS_DEFAULT = 80_000
+
+COMPACT_PROMPT = """\
+You are summarising a stretch of an AI agent's conversation log so the
+structured details survive after the raw messages are deleted to save space.
+
+Preserve verbatim or near-verbatim:
+- decisions made and the reasoning behind them
+- code, file paths, command lines, error messages
+- action items, blockers, open questions
+- exact configuration values, hostnames, ports, environment variables
+- anything tagged MEMORY[<cat>]: in the original transcript
+
+Drop:
+- pleasantries, acknowledgements, generic boilerplate, repeated framing.
+
+Format the output as a structured Markdown brief with sections:
+  ## Decisions
+  ## Code, Files & Commands
+  ## Action Items
+  ## Verbatim Snippets
+  ## Current State (at the end of this stretch)
+
+Be exhaustive; favour completeness over brevity. No preamble, no commentary.
+
+CONVERSATION TO SUMMARISE:
+"""
+
+
+def _ollama_generate(prompt: str, model: str, host: str,
+                     timeout_s: int = 240) -> Optional[str]:
+    """POST to Ollama /api/generate, return the response text or None on
+    any failure (network, non-200, malformed body, empty result)."""
+    import urllib.request, urllib.error
+    body = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.2, "num_predict": 4096, "num_ctx": 32768},
+    }
+    try:
+        req = urllib.request.Request(
+            f"{host}/api/generate",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            if resp.status != 200:
+                return None
+            payload = json.loads(resp.read().decode("utf-8"))
+            text = (payload.get("response") or "").strip()
+            return text or None
+    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError,
+            json.JSONDecodeError):
+        return None
+
+
+def _ollama_available(host: str, model: str) -> bool:
+    """Ping /api/tags and confirm the requested model is installed."""
+    import urllib.request, urllib.error
+    try:
+        with urllib.request.urlopen(f"{host}/api/tags", timeout=5) as resp:
+            if resp.status != 200:
+                return False
+            tags = json.loads(resp.read().decode("utf-8")).get("models", [])
+        names = [m.get("name", "") for m in tags]
+        return any(n == model or n.startswith(f"{model}:") or n.startswith(f"{model}-")
+                   for n in names)
+    except Exception:
+        return False
+
+
+def _select_compactable(conn: sqlite3.Connection, project: str,
+                        chat_older: _dt.timedelta, keep_last: int) -> list:
+    """Messages older than `chat_older` AND outside the most-recent
+    `keep_last` rows for this project."""
+    cutoff = (_dt.datetime.now(_dt.timezone.utc) - chat_older) \
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+    # First find the id of the (keep_last+1)th-most-recent message; everything
+    # older AND older than the time cutoff is fair game.
+    row = conn.execute(
+        "SELECT id FROM messages WHERE project = ? "
+        "ORDER BY id DESC LIMIT 1 OFFSET ?",
+        (project, keep_last),
+    ).fetchone()
+    if not row:
+        return []
+    keep_threshold_id = row["id"]
+    return conn.execute(
+        "SELECT id, request_id, agent, direction, channel, status, content, "
+        "timestamp FROM messages "
+        "WHERE project = ? AND id <= ? AND timestamp < ? "
+        "ORDER BY id ASC",
+        (project, keep_threshold_id, cutoff),
+    ).fetchall()
+
+
+def _chunk_messages(rows: list, target_chars: int) -> list[list]:
+    """Group consecutive rows into chunks of approximately `target_chars`
+    bytes worth of content. Each chunk preserves message order."""
+    if not rows:
+        return []
+    chunks: list[list] = [[]]
+    cur_chars = 0
+    for r in rows:
+        line_len = len(r["content"] or "") + 50  # accounting for header
+        if cur_chars + line_len > target_chars and chunks[-1]:
+            chunks.append([])
+            cur_chars = 0
+        chunks[-1].append(r)
+        cur_chars += line_len
+    return [c for c in chunks if c]
+
+
+def _render_chunk_text(rows: list) -> str:
+    """Format a chunk of messages as markdown for the Ollama prompt."""
+    out = []
+    for r in rows:
+        arrow = "→" if r["direction"] == "out" else "←"
+        head = f"### {r['timestamp']} {arrow} {r['agent']}"
+        if r["status"]:
+            head += f"  ({r['status']})"
+        if r["request_id"]:
+            head += f"  [{r['request_id'][:24]}]"
+        out.append(head)
+        out.append(r["content"] or "")
+        out.append("")
+    return "\n".join(out)
+
+
+def cmd_compact(args: argparse.Namespace) -> None:
+    chat_older = parse_duration(args.chat_older)
+    keep_last = args.keep_last
+    host = args.ollama_host
+    model = args.model
+
+    conn = connect(); migrate(conn)
+
+    # Pick projects: --session restricts; otherwise process all.
+    if args.session:
+        projects = [expand_path(args.session)]
+    elif args.all_sessions:
+        projects = [r["path"] for r in conn.execute(
+            "SELECT path FROM projects").fetchall()]
+    else:
+        projects = [resolve_project(None)]
+
+    plan: list[dict] = []
+    for proj in projects:
+        rows = _select_compactable(conn, proj, chat_older, keep_last)
+        if not rows:
+            continue
+        chunks = _chunk_messages(rows, args.chunk_chars)
+        total_chars = sum(len(r["content"] or "") for r in rows)
+        plan.append({
+            "project": proj,
+            "messages_to_compact": len(rows),
+            "chunks": len(chunks),
+            "raw_chars": total_chars,
+            "id_range": (rows[0]["id"], rows[-1]["id"]),
+            "date_range": (rows[0]["timestamp"], rows[-1]["timestamp"]),
+            "chunk_rows": chunks,
+        })
+
+    if not plan:
+        print("compact: nothing eligible (no messages older than threshold + outside keep window)")
+        if args.json:
+            json.dump({"projects": [], "dry_run": bool(args.dry_run)}, sys.stdout); sys.stdout.write("\n")
+        return
+
+    if args.dry_run:
+        # Surface plan without doing anything.
+        print(f"compact dry-run: {len(plan)} project(s), "
+              f"--chat-older={args.chat_older} --keep-last={keep_last}")
+        for p in plan:
+            print(f"  {p['project']}")
+            print(f"    messages: {p['messages_to_compact']}  "
+                  f"chunks: {p['chunks']}  raw_chars: {p['raw_chars']:,}")
+            print(f"    id range: {p['id_range'][0]}..{p['id_range'][1]}  "
+                  f"date range: {p['date_range'][0]}..{p['date_range'][1]}")
+        if args.json:
+            for p in plan:
+                p.pop("chunk_rows", None)
+            json.dump({"projects": plan, "dry_run": True}, sys.stdout, indent=2, default=str); sys.stdout.write("\n")
+        return
+
+    # Live run — confirm Ollama first. We refuse to delete anything if Ollama
+    # isn't reachable so old chat is never lost without a summary in place.
+    if not _ollama_available(host, model):
+        die(f"Ollama unavailable or model {model!r} not installed at {host}. "
+            f"Aborted with no changes. Pull the model with: ollama pull {model}")
+
+    total_summarised = 0
+    total_deleted = 0
+    failures: list[str] = []
+    for p in plan:
+        proj = p["project"]
+        for chunk_rows in p["chunk_rows"]:
+            chunk_text = _render_chunk_text(chunk_rows)
+            prompt = COMPACT_PROMPT + "\n" + chunk_text + "\n\nSUMMARY:\n"
+            print(f"  [{proj}] summarising chunk of {len(chunk_rows)} msgs "
+                  f"(~{len(chunk_text):,} chars)...", file=sys.stderr)
+            summary = _ollama_generate(prompt, model, host)
+            if not summary:
+                failures.append(f"{proj}: chunk {chunk_rows[0]['id']}..{chunk_rows[-1]['id']} "
+                                "ollama returned no result; aborting whole compact run")
+                break
+
+            id_min = chunk_rows[0]["id"]
+            id_max = chunk_rows[-1]["id"]
+            ts_min = chunk_rows[0]["timestamp"]
+            ts_max = chunk_rows[-1]["timestamp"]
+            now = now_iso()
+            cur = conn.execute(
+                """
+                INSERT INTO memories
+                    (project, category, key, content, importance, expires_at,
+                     created_at, updated_at)
+                VALUES (?, 'chat_summary', ?, ?, 4, NULL, ?, ?)
+                """,
+                (proj, f"compact:{id_min}-{id_max}",
+                 (f"_Compaction summary of messages {id_min}..{id_max} "
+                  f"({ts_min} → {ts_max}, {len(chunk_rows)} messages)._\n\n{summary}"),
+                 now, now),
+            )
+            mem_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO memories_audit (memory_id, action, content_before, "
+                "content_after, timestamp) VALUES (?, 'create', NULL, ?, ?)",
+                (mem_id, summary[:500], now))
+            # Now delete the source messages.
+            conn.execute("DELETE FROM messages WHERE id BETWEEN ? AND ? AND project = ?",
+                         (id_min, id_max, proj))
+            total_deleted += len(chunk_rows)
+            total_summarised += 1
+        if failures:
+            break
+
+    conn.commit()
+    if failures:
+        for f in failures:
+            print(f"compact ERROR: {f}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.json:
+        json.dump({"summaries_created": total_summarised,
+                   "messages_deleted": total_deleted,
+                   "dry_run": False}, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print(f"compact: created {total_summarised} chat_summary memories, "
+              f"deleted {total_deleted} messages")
+
+
 def cmd_message_add(args: argparse.Namespace) -> None:
     """Internal: insert a row into messages. Used by buck-review.sh to log
     every exchange. Auto-creates the project row so callers don't need to
@@ -1347,6 +1610,25 @@ def build_parser() -> argparse.ArgumentParser:
     ssp.add_argument("path", help="project path or unique substring")
     ssp.add_argument("--max", type=int, default=20)
     ssp.set_defaults(func=cmd_sessions)
+
+    sp = sub.add_parser("compact", parents=[common],
+                        help="lossily summarise old chat messages via Ollama; memories untouched")
+    sp.add_argument("--chat-older", dest="chat_older", default="14d",
+                    help="messages older than this become eligible (e.g. 14d, 24h)")
+    sp.add_argument("--keep-last", dest="keep_last", type=int, default=200,
+                    help="keep the last N messages per project regardless of age")
+    sp.add_argument("--chunk-chars", dest="chunk_chars", type=int,
+                    default=COMPACT_CHUNK_CHARS_DEFAULT,
+                    help=f"chars per Ollama chunk (default {COMPACT_CHUNK_CHARS_DEFAULT})")
+    sp.add_argument("--model", default=COMPACT_MODEL_DEFAULT,
+                    help=f"Ollama model (default {COMPACT_MODEL_DEFAULT})")
+    sp.add_argument("--ollama-host", dest="ollama_host", default=OLLAMA_URL_DEFAULT,
+                    help="Ollama base URL (default $OLLAMA_HOST or http://localhost:11434)")
+    sp.add_argument("--dry-run", dest="dry_run", action="store_true")
+    sp.add_argument("--session", help="restrict to one project (default: CWD)")
+    sp.add_argument("--all-sessions", dest="all_sessions", action="store_true",
+                    help="compact every registered project")
+    sp.set_defaults(func=cmd_compact)
 
     sp = sub.add_parser("archive", parents=[common],
                         help="snapshot project memories+messages into a compressed archive")
