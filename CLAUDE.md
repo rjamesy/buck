@@ -7,7 +7,14 @@ This project uses **buck-context** for cross-session persistent memory + convers
 ```bash
 ~/Mac\ Projects/buck/buck-context menu --json
 ```
-Parse the JSON and present the `options[]` to the user via `AskUserQuestion` (multi-select). Each option has `key`, `label`, `desc`, `command`, `available`. Skip pending items (`available: false`) unless explicitly asked. After the user picks, run the corresponding `command` and incorporate the output into the conversation context. If they pick `skip`, proceed normally.
+The JSON returns a `screens` object plus a `start_screen` (= `"main"`). Walk it as a hierarchical menu via chained AskUserQuestion calls (each AskUserQuestion is capped at 4 options):
+1. Render `screens[start_screen].options` via AskUserQuestion. The screen's `question` becomes the prompt.
+2. Find the option the user picked by `key`.
+3. If the option has a `next_screen` field, descend into `screens[next_screen]` and repeat from step 1.
+4. If it has a `command` field that's a literal command (no `<placeholder>`), run it via Bash.
+5. If the `command` contains `<placeholder>` slots (e.g. `buck-context update <id> "<new content>"`), prompt the user (free-form text or a follow-up AskUserQuestion) for each slot, substitute, then run.
+6. If `command` is `null` (the `skip` option), do nothing — proceed normally.
+7. After running, bring the command's stdout into the conversation context.
 
 **During the session**, write structured state as it accrues:
 ```bash

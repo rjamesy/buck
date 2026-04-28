@@ -565,16 +565,18 @@ def cmd_sessions(args: argparse.Namespace) -> None:
 
 
 def cmd_menu(args: argparse.Namespace) -> None:
-    """Print a menu of session-start options. Designed to be called by Claude
-    Code as the very first action in a buck-context-enabled project; output
-    feeds straight into AskUserQuestion (multi-select).
+    """Emit a hierarchical menu Claude consumes via chained AskUserQuestion
+    calls. The picker tool maxes at 4 options, so we organise actions into
+    screens of ≤4 options each.
 
-    Each option has:
-      key         stable id for routing the user's choice
-      label       short user-facing label
-      command     concrete shell command Claude should invoke when chosen
-      available   whether the underlying feature is wired up in this build
-      requires    curriculum lesson it lands in (for `available=false`)
+    Each option carries either:
+      command          ─ concrete shell command Claude runs when selected
+                          (positional fillers shown as <id>, <query>, ...
+                          let Claude prompt for the missing args)
+      next_screen      ─ id of the screen to descend into
+
+    Top-level screen `main` covers the most-likely-needed session-start
+    actions; `manage` is the second tier for less common operations.
     """
     proj = resolve_project(args.session)
     conn = connect(); migrate(conn)
@@ -587,58 +589,114 @@ def cmd_menu(args: argparse.Namespace) -> None:
         "SELECT COUNT(*) c FROM messages WHERE project = ?", (proj,)
     ).fetchone()["c"] if p else 0
 
-    options = [
-        {"key": "recap",
-         "label": "Read project context",
-         "desc": f"Markdown brief of memories and recent conversation ({mem_count} memories, {msg_count} messages).",
-         "command": "buck-context recap",
-         "available": True},
-        {"key": "search",
-         "label": "Search memories across sessions",
-         "desc": "LIKE-search for a topic across this or all projects.",
-         "command": "buck-context search \"<query>\" --all-sessions",
-         "available": True},
-        {"key": "list",
-         "label": "List memories by category",
-         "desc": "Tabular list, optionally filtered by --cat.",
-         "command": "buck-context list",
-         "available": True},
-        {"key": "modify",
-         "label": "Modify a memory",
-         "desc": "Replace content of a memory by id.",
-         "command": "buck-context update <id> \"<new content>\"",
-         "available": True},
-        {"key": "delete",
-         "label": "Delete a memory",
-         "desc": "Hard-delete with audit row.",
-         "command": "buck-context delete <id>",
-         "available": True},
-        {"key": "push-gpt",
-         "label": "Send context to GPT/Codex",
-         "desc": "Chunked READY/ACK/LOADED handoff into a fresh GPT thread.",
-         "command": "buck-context push-gpt --channel=a",
-         "available": True},
-        {"key": "archive",
-         "label": "Archive current context",
-         "desc": "Snapshot memories+recent messages to a STRATA-compressed blob.",
-         "command": "buck-context archive --title=\"...\"",
-         "available": True},
-        {"key": "archives",
-         "label": "Browse archived context",
-         "desc": "List historical snapshots; restore by id.",
-         "command": "buck-context archives list",
-         "available": True},
-        {"key": "compact",
-         "label": "Compact old chat (Ollama)",
-         "desc": "Selectively summarise old messages into chat_summary memories. Categorised memories untouched.",
-         "command": "buck-context compact --dry-run",
-         "available": True},
-        {"key": "skip",
-         "label": "Skip — start fresh",
-         "desc": "Do nothing; don't load context.",
-         "command": None,
-         "available": True},
-    ]
+    screens = {
+        "main": {
+            "question": (f"Buck Context — what would you like to do for {title}? "
+                         f"({mem_count} memories, {msg_count} messages)"),
+            "options": [
+                {"key": "recap",
+                 "label": "Read project context",
+                 "desc": "Markdown brief of memories and recent conversation. Run buck-context recap.",
+                 "command": "buck-context recap"},
+                {"key": "push-gpt",
+                 "label": "Send context to GPT",
+                 "desc": "Chunked READY/ACK/LOADED handoff into the active ChatGPT thread.",
+                 "command": "buck-context push-gpt --channel=a"},
+                {"key": "manage",
+                 "label": "Find / edit / archive / compact…",
+                 "desc": "Drill into a second menu for search, list, modify, delete, archive, restore, compact.",
+                 "next_screen": "manage"},
+                {"key": "skip",
+                 "label": "Skip — start fresh",
+                 "desc": "Do nothing; don't load context.",
+                 "command": None},
+            ],
+        },
+        "manage": {
+            "question": "Manage Buck Context — pick a category:",
+            "options": [
+                {"key": "find",
+                 "label": "Find / list memories",
+                 "desc": "Search by keyword, list by category, or list everything.",
+                 "next_screen": "find"},
+                {"key": "edit",
+                 "label": "Modify or delete a memory",
+                 "desc": "Update content of an existing memory or hard-delete by id.",
+                 "next_screen": "edit"},
+                {"key": "archives",
+                 "label": "Archive / restore",
+                 "desc": "Create a new STRATA-compressed snapshot, browse, restore, export, import.",
+                 "next_screen": "archives"},
+                {"key": "compact",
+                 "label": "Compact old chat (Ollama)",
+                 "desc": "Lossily summarise old messages into chat_summary memories. Categorised memories untouched.",
+                 "command": "buck-context compact --dry-run"},
+            ],
+        },
+        "find": {
+            "question": "Find / list — how would you like to look?",
+            "options": [
+                {"key": "list-all",
+                 "label": "List everything in this project",
+                 "desc": "Tabular list of all memories.",
+                 "command": "buck-context list"},
+                {"key": "list-cat",
+                 "label": "List by category",
+                 "desc": "Filter by category — Claude will ask which.",
+                 "command": "buck-context list --cat=<category>"},
+                {"key": "search-here",
+                 "label": "Search this project",
+                 "desc": "LIKE-search content + key — Claude will ask for the query.",
+                 "command": "buck-context search \"<query>\""},
+                {"key": "search-all",
+                 "label": "Search across ALL projects",
+                 "desc": "Cross-session search; project column shown.",
+                 "command": "buck-context search \"<query>\" --all-sessions"},
+            ],
+        },
+        "edit": {
+            "question": "Edit — what would you like to change?",
+            "options": [
+                {"key": "list-first",
+                 "label": "Show me memories first",
+                 "desc": "Start by listing so you can pick an id.",
+                 "command": "buck-context list"},
+                {"key": "update",
+                 "label": "Update a memory",
+                 "desc": "Replace content; Claude will ask for id + new content.",
+                 "command": "buck-context update <id> \"<new content>\""},
+                {"key": "delete",
+                 "label": "Delete a memory",
+                 "desc": "Hard-delete with audit row; Claude will ask for id.",
+                 "command": "buck-context delete <id>"},
+                {"key": "back",
+                 "label": "Back",
+                 "desc": "Return to main menu.",
+                 "next_screen": "main"},
+            ],
+        },
+        "archives": {
+            "question": "Archives — pick an operation:",
+            "options": [
+                {"key": "create",
+                 "label": "Create new archive",
+                 "desc": "Snapshot current state with a title — Claude will ask for the title.",
+                 "command": "buck-context archive --title=\"<title>\""},
+                {"key": "list",
+                 "label": "Browse archives",
+                 "desc": "List historical snapshots by date.",
+                 "command": "buck-context archives list"},
+                {"key": "view",
+                 "label": "View an archive",
+                 "desc": "Markdown render of a specific archive — Claude will ask for the id.",
+                 "command": "buck-context archives view <id>"},
+                {"key": "restore",
+                 "label": "Restore an archive",
+                 "desc": "Additive restore into the current project — Claude will ask for the id.",
+                 "command": "buck-context archives restore <id>"},
+            ],
+        },
+    }
 
     payload = {
         "current_project": proj,
@@ -646,21 +704,33 @@ def cmd_menu(args: argparse.Namespace) -> None:
         "registered": p is not None,
         "memory_count": mem_count,
         "message_count": msg_count,
-        "options": options,
+        "screens": screens,
+        "start_screen": "main",
     }
     if args.json:
         json.dump(payload, sys.stdout, indent=2); sys.stdout.write("\n")
         return
+
+    # Human-readable output: print every screen so user can see the full tree.
     print(f"# Buck Context — {title}")
     print(f"  path: {proj}")
     print(f"  memories: {mem_count}   messages: {msg_count}   "
           f"registered: {'yes' if p else 'no'}\n")
-    for o in options:
-        suffix = "" if o["available"] else f"  [pending {o['requires']}]"
-        print(f"  [{o['key']:>10s}] {o['label']}{suffix}")
-        print(f"             → {o['desc']}")
-        if o.get("command"):
-            print(f"             $ {o['command']}")
+    visited: list[tuple[str, dict]] = [(payload["start_screen"], screens[payload["start_screen"]])]
+    seen = {payload["start_screen"]}
+    while visited:
+        sid, s = visited.pop(0)
+        print(f"## screen: {sid}")
+        print(f"   {s['question']}")
+        for o in s["options"]:
+            target = ("→ " + o["next_screen"]) if "next_screen" in o else (
+                "$ " + (o["command"] or "(no-op)"))
+            print(f"   [{o['key']:>12s}]  {o['label']:32s}  {target}")
+            print(f"                  {o['desc']}")
+            if "next_screen" in o and o["next_screen"] not in seen:
+                seen.add(o["next_screen"])
+                visited.append((o["next_screen"], screens[o["next_screen"]]))
+        print()
 
 
 # ---------- compression for archives (STRATA primary, zlib fallback) ----------
