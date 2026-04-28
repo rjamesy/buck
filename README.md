@@ -11,6 +11,7 @@ Buck is a macOS toolkit that bridges AI coding assistants (Claude Code, Codex, C
 | **Buck** | Menu bar app | Core ChatGPT bridge — send/read messages via AX API |
 | **CursorBridge** | Module in Buck | Cursor IDE chat injection — keyboard simulation + AX bubble reading |
 | **CodexBridge** | Module in Buck | OpenAI Responses API — direct HTTP calls, no desktop app needed |
+| **buck-context** | Shell CLI (Python) | Persistent project memory + conversation log; all Buck exchanges auto-log to SQLite, structured memories survive across sessions, GPT can curate via `MEMORY[<cat>]:` markup |
 | **Rogers** | Menu bar app | ChatGPT session archiver — polls AX tree, stores in SQLite, summarizes via Ollama |
 | **BuckTeams** | Window app | Multi-AI group chat — GPT + Codex via OpenAI API, Claude via file IPC |
 | **BuckCodex** | Window app | OpenAI Codex UI — direct API client for local Codex sessions |
@@ -406,6 +407,131 @@ BuckSpeak is a separate local speak/listen tool for voice-loop testing. It does 
 - Listen mode runs inside the app process (handles macOS microphone/speech permissions)
 - Default voice: `Lee Premium`
 - Output: JSON with `status`, `spoken_text`, `heard_text`, timing fields
+
+## buck-context — Persistent Project Memory
+
+`buck-context` is a single-file Python CLI (stdlib only — `sqlite3` + `argparse`) that gives every project under Buck a persistent, queryable memory of categorised facts plus a full Claude↔GPT↔Codex conversation log. Backing store is one SQLite file at `~/.buck/memory.db`, keyed on the project's absolute path.
+
+### Why
+
+Without it, Claude Code sessions forget everything between terminal launches. CLAUDE.md captures the broad project rules, but ephemeral state (current refactor stage, server hostnames, do/don'ts learned this hour, what GPT just decided) gets lost when you `exit` the shell. buck-context closes that loop:
+
+- Categorised memories survive forever (or until explicitly deleted/archived)
+- Every `buck-review.sh` exchange auto-logs to a `messages` table — full transcript
+- Cross-session retrieval (`--all-sessions`) lets you ask "did I ever write down X?" from any project
+- GPT can curate memories itself by emitting `MEMORY[<category>]: <one-line content>` in any reply — `buck-review.sh` parses + persists
+- Pushing context into a fresh ChatGPT thread is one command (`push-gpt`) with a chunked READY/ACK/LOADED handoff
+- Old chat can be lossily summarised via local Ollama (`compact`) — categorised memories never touched
+- Snapshot/restore via STRATA-compressed archive blobs
+
+### Schema (SQLite, `~/.buck/memory.db`)
+
+```
+projects        path PK, title, last_active_at, summary
+memories        id, project FK, category, key, content, importance, expires_at
+memories_audit  every create/update/delete tracked
+messages        id, project FK, request_id, agent, direction (out|in), channel, status, content
+archives        id, project FK, title, raw_bytes, compressed_bytes, compression, blob, metadata_json
+```
+
+`PRAGMA user_version = 2` (v1 = core tables, v2 = archives).
+
+### Categories
+
+`must_do` · `must_read` · `do_dont` · `server_config` · `current_state` · `decision` · `failed_approach` · `plan` · `open_question` · `glossary` · `code_location` · `tool_pref` · `workflow` · `permission` · `persona` · `external_ref` · `fact` · `chat_summary`
+
+Strings, additive — anything else works too. `recap` orders by a curated list.
+
+### Common usage
+
+```bash
+# Bootstrap a project (idempotent)
+cd ~/your-project
+buck-context init
+
+# Read everything
+buck-context recap                                    # markdown brief
+buck-context list --cat=server_config                 # tabular
+buck-context search "ai-server" --all-sessions        # cross-project
+
+# Write
+buck-context write must_do "ship buck-context tests"
+buck-context write server_config "AI box: rjamesy@100.103.104.48" --key=ai-server --importance=8
+buck-context write decision "chose hash-id over AX-id" --importance=7
+buck-context update <id> "<new content>"
+buck-context delete <id> --reason="completed"
+
+# Cross-session
+buck-context sessions list                            # registered projects
+buck-context sessions show buck                       # recap by path-prefix
+buck-context recap --session=~/AI_Projects/AI_Server  # different project
+```
+
+### Hand-off to a fresh ChatGPT thread
+
+```bash
+buck-context push-gpt --channel=a              # default 20k chars/chunk
+buck-context push-gpt --max-chunk=10000        # smaller chunks
+buck-context push-gpt --resume-from=4          # retry from chunk 4 after a partial fail
+buck-context push-gpt --dry-run                # show chunk plan only
+```
+
+Protocol: preamble → `READY` → 1..N-1 chunks → `ACK` each → final chunk → `LOADED`. Each step has 2 retries. The whole handoff is logged into `messages` like any other exchange.
+
+### Archive / restore
+
+```bash
+buck-context archive --title="post-launch"     # snapshot memories + last 200 messages
+buck-context archives list
+buck-context archives view <id>                # markdown render
+buck-context archives restore <id>             # additive restore (audit-tracked)
+buck-context archives export <id> > snap.json  # portable BUCKCTX1 envelope
+buck-context archives import < snap.json
+buck-context archives delete <id>
+```
+
+Compression: prefers `~/AI_Projects/STRATA/strata.py` if importable, falls back to zlib level 9. ~90% smaller than raw JSON for typical transcripts (zlib + 1 byte for STRATA's mode tag — STRATA's structural transforms don't help on plain text but don't hurt either).
+
+### Selective Ollama compaction
+
+```bash
+buck-context compact --dry-run                                    # preview, no writes
+buck-context compact --chat-older=14d --keep-last=200             # live
+buck-context compact --model=qwen2.5:7b-instruct --all-sessions   # every project
+```
+
+Older messages → chunked → Ollama summary written as `memories.category='chat_summary'` → originals deleted with audit. **Categorised memories (`must_do`, `do_dont`, `server_config`, `decision`, etc.) are never touched by `compact`.** Aborts cleanly with no deletions if Ollama is unreachable.
+
+### Session-start menu (Claude Code bootstrap)
+
+```bash
+buck-context menu --json
+```
+
+Returns a hierarchical `screens` object (`main` → `manage` → `find`/`edit`/`archives`). Each screen has ≤4 options to fit Claude's `AskUserQuestion` cap. Walk it via chained pickers; descend on `next_screen`, run on `command`, prompt for `<placeholder>` slots inline. The project + global `CLAUDE.md` blocks instruct Claude to call this as the very first action in any buck-context-enabled project.
+
+### Integration with `buck-review.sh`
+
+Built in — no separate wiring step. Every Buck exchange:
+1. Auto-resolves `SESSION_ID = $(pwd -P)` if `--session` not provided
+2. Logs the outbound request as a `messages` row right after the inbox file is written
+3. Logs the inbound response inside the existing `log_exchange()` (alongside `history.jsonl`, which is preserved)
+4. Scans the response for `^MEMORY\[<cat>\]: <content>$` lines and persists each via `buck-context write --key=gpt-suggested --importance=6`
+
+Existing `--session SESSION_ID` flag still wins. Existing `~/.buck/history.jsonl` raw log unchanged.
+
+### Operations
+
+```bash
+buck-context status              # project counts
+buck-context log --n=20          # recent messages (this project)
+buck-context prune               # delete expired memories
+buck-context doctor              # schema check, orphan check
+buck-context export --format=md  # backup
+buck-context message-add ...     # internal — used by buck-review.sh
+```
+
+Files: `buck-context` (the CLI, ~1500 LOC Python). Database: `~/.buck/memory.db`. Existing forensic log `~/.buck/history.jsonl` is preserved untouched.
 
 ## Rogers — Session Archiver
 
