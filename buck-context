@@ -402,15 +402,14 @@ def cmd_delete(args: argparse.Namespace) -> None:
         print(f"deleted memory id={args.id}")
 
 
-def cmd_recap(args: argparse.Namespace) -> None:
+def render_recap(proj: str, *, max_per_cat: int = 20, include_global: bool = False,
+                 include_messages: bool = True) -> str:
+    """Pure renderer — returns the markdown brief as a string. Used by both
+    cmd_recap (prints) and cmd_push_gpt (chunks to GPT)."""
     conn = connect(); migrate(conn)
-    proj = resolve_project(args.session)
     p = conn.execute("SELECT * FROM projects WHERE path = ?", (proj,)).fetchone()
     if not p:
-        # Render a "no project" recap rather than exit-erroring; lets Claude
-        # call recap on a fresh dir without failure.
-        print(f"# Project: {Path(proj).name}\n  (not yet initialised — run `buck-context init`)\n")
-        return
+        return f"# Project: {Path(proj).name}\n  (not yet initialised — run `buck-context init`)\n"
 
     rows = conn.execute(
         "SELECT * FROM memories WHERE project = ? "
@@ -420,7 +419,7 @@ def cmd_recap(args: argparse.Namespace) -> None:
     by_cat: dict[str, list] = {}
     for r in rows:
         by_cat.setdefault(r["category"], []).append(r)
-    if args.global_:
+    if include_global:
         for r in conn.execute(
             "SELECT * FROM memories WHERE project IS NULL "
             "ORDER BY importance DESC, updated_at DESC"
@@ -439,7 +438,7 @@ def cmd_recap(args: argparse.Namespace) -> None:
         if cat in seen_cats:
             continue
         seen_cats.add(cat)
-        items = by_cat[cat][: args.max] if args.max else by_cat[cat]
+        items = by_cat[cat][:max_per_cat] if max_per_cat else by_cat[cat]
         if not items:
             continue
         out.append(f"\n## {cat.replace('_', ' ').title()}")
@@ -447,21 +446,26 @@ def cmd_recap(args: argparse.Namespace) -> None:
             tag = f" `[{r['key']}]`" if r["key"] else ""
             out.append(f"- _#{r['id']}_  {r['content']}{tag}  _(imp {r['importance']})_")
 
-    # Recent messages tail.
-    recent = conn.execute(
-        "SELECT direction, agent, status, content, timestamp "
-        "FROM messages WHERE project = ? ORDER BY id DESC LIMIT ?",
-        (proj, max(args.max or 10, 10)),
-    ).fetchall()
-    if recent:
-        out.append("\n## Recent Conversation")
-        for r in reversed(recent):
-            arrow = "→" if r["direction"] == "out" else "←"
-            preview = (r["content"] or "").replace("\n", " ")[:120]
-            out.append(f"- {r['timestamp']} {arrow} {r['agent']} "
-                       f"{('('+r['status']+')') if r['status'] else ''} {preview}")
+    if include_messages:
+        recent = conn.execute(
+            "SELECT direction, agent, status, content, timestamp "
+            "FROM messages WHERE project = ? ORDER BY id DESC LIMIT ?",
+            (proj, max(max_per_cat or 10, 10)),
+        ).fetchall()
+        if recent:
+            out.append("\n## Recent Conversation")
+            for r in reversed(recent):
+                arrow = "→" if r["direction"] == "out" else "←"
+                preview = (r["content"] or "").replace("\n", " ")[:120]
+                out.append(f"- {r['timestamp']} {arrow} {r['agent']} "
+                           f"{('('+r['status']+')') if r['status'] else ''} {preview}")
 
-    print("\n".join(out))
+    return "\n".join(out)
+
+
+def cmd_recap(args: argparse.Namespace) -> None:
+    proj = resolve_project(args.session)
+    print(render_recap(proj, max_per_cat=args.max, include_global=args.global_))
 
 
 def cmd_search(args: argparse.Namespace) -> None:
@@ -637,6 +641,185 @@ def cmd_menu(args: argparse.Namespace) -> None:
         print(f"             → {o['desc']}")
         if o.get("command"):
             print(f"             $ {o['command']}")
+
+
+def _chunk_for_push(text: str, limit: int) -> list[str]:
+    """Split `text` on paragraph (\\n\\n) boundaries into chunks of <= `limit`
+    chars. If a paragraph exceeds `limit` it gets hard-cut at character
+    boundaries (rare for recap content)."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for para in text.split("\n\n"):
+        # Hard cut overlong paragraphs to keep within limit.
+        while len(para) > limit:
+            if current:
+                chunks.append("\n\n".join(current))
+                current, current_len = [], 0
+            chunks.append(para[:limit])
+            para = para[limit:]
+        # +2 accounts for the joining "\n\n".
+        if current_len + len(para) + 2 > limit and current:
+            chunks.append("\n\n".join(current))
+            current, current_len = [para], len(para)
+        else:
+            current.append(para)
+            current_len += len(para) + 2
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
+
+
+def _strip_laws_appendix(text: str) -> str:
+    """Buck workflow appends a 'LAWS REMINDER' block to every GPT response.
+    For ack detection we only care about GPT's actual reply, not the
+    boilerplate. Cuts at the first '━━━' separator."""
+    cut = text.split("━━━", 1)[0]
+    return cut.strip()
+
+
+def _expects_token(response: str, token: str) -> bool:
+    """Lenient match — accept the expected token as a standalone first
+    non-empty line, OR anywhere in the first 3 lines, since GPT sometimes
+    wraps with light commentary despite explicit ack instructions."""
+    body = _strip_laws_appendix(response)
+    head_lines = [ln.strip() for ln in body.splitlines() if ln.strip()][:3]
+    if not head_lines:
+        return False
+    if head_lines[0] == token:
+        return True
+    # Tolerate quoted forms like "ACK." or "READY!".
+    if re.fullmatch(rf"{re.escape(token)}[.!\s]*", head_lines[0]):
+        return True
+    return any(token in ln for ln in head_lines)
+
+
+def _send_buck(content: str, channel: str, prompt: str = "",
+               timeout_s: int = 720) -> dict:
+    """Invoke buck-review.sh once and return the parsed JSON response.
+    Raises RuntimeError on non-zero exit or unparseable response."""
+    import subprocess
+    bcrev = str(Path(__file__).resolve().parent / "buck-review.sh")
+    cmd = [bcrev, "--prompt", prompt, "--stdin"]
+    if channel:
+        cmd[1:1] = ["--channel", channel]
+    try:
+        result = subprocess.run(cmd, input=content, capture_output=True,
+                                text=True, timeout=timeout_s + 60)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"buck-review timed out after {timeout_s}s")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"buck-review exit {result.returncode}: {result.stderr[:300]}")
+    # buck-review.sh prints status messages to stderr and the JSON to stdout.
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        # Try last line in case stderr leaked into stdout.
+        for line in reversed(result.stdout.strip().splitlines()):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+        raise RuntimeError(f"buck-review response not JSON: {result.stdout[:300]}")
+
+
+def cmd_push_gpt(args: argparse.Namespace) -> None:
+    """Push the current recap into a fresh GPT session via a chunked
+    handoff with READY/ACK/LOADED guards."""
+    proj = resolve_project(args.session)
+    text = render_recap(proj, max_per_cat=args.max, include_global=args.global_,
+                        include_messages=not args.no_messages)
+    if not text.strip():
+        die("recap is empty; nothing to push")
+
+    chunks = _chunk_for_push(text, args.max_chunk)
+    n = len(chunks)
+    print(f"push-gpt: project={proj}  chunks={n}  channel={args.channel}",
+          file=sys.stderr)
+
+    if args.dry_run:
+        for i, c in enumerate(chunks, 1):
+            head = c.splitlines()[0] if c else ""
+            print(f"  [dry] PART {i}/{n}  {len(c):>6} chars  head=\"{head[:60]}\"")
+        return
+
+    preamble = (
+        f"CONTEXT-PRELOAD-PROTOCOL: I'm about to deliver project context in {n} part"
+        f"{'s' if n > 1 else ''}. For each part except the last, reply with EXACTLY one "
+        f"word: ACK. For the last part, reply with EXACTLY one word: LOADED. "
+        f"Do not summarise, do not ask questions, do not respond beyond ACK/LOADED.\n\n"
+        f"After the context is LOADED, you may at any point during our subsequent "
+        f"conversation ask me to persist a fact by emitting a single line of the form:\n"
+        f"    MEMORY[<category>]: <one-line content>\n"
+        f"on its own. Categories: must_do, do_dont, server_config, decision, "
+        f"failed_approach, current_state, open_question, fact. Claude will detect "
+        f"these lines and persist them via buck-context. Do NOT write MEMORY blocks "
+        f"during the context preload — only after LOADED.\n\n"
+        f"Reply now with READY only if you understand."
+    )
+
+    # Step 1 — preamble (skipped via --resume-from > 0).
+    if args.resume_from <= 0:
+        print("  step 1/?: preamble → expecting READY", file=sys.stderr)
+        ok = _attempt_with_retries(preamble, "READY", args.channel, args.retries)
+        if not ok:
+            die("preamble: GPT did not reply READY (aborted, no chunks sent)")
+
+    # Steps 2..N-1 — non-final chunks expecting ACK.
+    start = max(args.resume_from, 1)
+    for i in range(start, n):
+        chunk = chunks[i - 1]
+        msg = (f"PART {i}/{n}\n===\n{chunk}\n===\n"
+               f"Reply ACK only.")
+        print(f"  step {i+1}/{n+1}: PART {i}/{n} ({len(chunk)} chars) → expecting ACK",
+              file=sys.stderr)
+        ok = _attempt_with_retries(msg, "ACK", args.channel, args.retries)
+        if not ok:
+            die(f"PART {i}/{n}: GPT did not reply ACK after {args.retries+1} attempts. "
+                f"Use --resume-from={i} to retry from this chunk.")
+
+    # Step N — final chunk expecting LOADED.
+    final = chunks[n - 1]
+    msg = (f"PART {n}/{n} (final)\n===\n{final}\n===\n"
+           f"Reply LOADED only. The next message I send will be a real request.")
+    print(f"  step {n+1}/{n+1}: PART {n}/{n} ({len(final)} chars) → expecting LOADED",
+          file=sys.stderr)
+    ok = _attempt_with_retries(msg, "LOADED", args.channel, args.retries)
+    if not ok:
+        die(f"final chunk: GPT did not reply LOADED. Context partially delivered. "
+            f"Use --resume-from={n} to retry the final chunk.")
+
+    print(f"push-gpt: complete  ({n} chunk{'s' if n > 1 else ''} acknowledged)",
+          file=sys.stderr)
+    if args.json:
+        json.dump({"chunks": n, "status": "loaded"}, sys.stdout); sys.stdout.write("\n")
+
+
+def _attempt_with_retries(content: str, expected: str, channel: str,
+                          retries: int) -> bool:
+    """Send `content` via buck-review.sh up to `retries+1` times until GPT's
+    response satisfies _expects_token(..., expected). Returns False if all
+    attempts fail."""
+    last_resp = ""
+    for attempt in range(retries + 1):
+        try:
+            j = _send_buck(content, channel)
+        except RuntimeError as e:
+            print(f"    attempt {attempt+1}: send error: {e}", file=sys.stderr)
+            continue
+        last_resp = j.get("response", "")
+        if _expects_token(last_resp, expected):
+            preview = _strip_laws_appendix(last_resp).splitlines()[0:1]
+            print(f"    ✓ got {expected} ({preview[0][:60] if preview else ''})",
+                  file=sys.stderr)
+            return True
+        body = _strip_laws_appendix(last_resp)
+        print(f"    attempt {attempt+1}: expected {expected}, got: "
+              f"{body[:120].replace(chr(10), ' ')!r}", file=sys.stderr)
+    return False
 
 
 def cmd_message_add(args: argparse.Namespace) -> None:
@@ -820,6 +1003,25 @@ def build_parser() -> argparse.ArgumentParser:
     ssp.add_argument("path", help="project path or unique substring")
     ssp.add_argument("--max", type=int, default=20)
     ssp.set_defaults(func=cmd_sessions)
+
+    sp = sub.add_parser("push-gpt", parents=[common],
+                        help="deliver recap to a GPT session in chunked READY/ACK/LOADED handoff")
+    sp.add_argument("--channel", default="a", help="a|b|cursor|codex (default a)")
+    sp.add_argument("--max-chunk", dest="max_chunk", type=int, default=20000,
+                    help="max chars per chunk (default 20000)")
+    sp.add_argument("--max", type=int, default=20, help="cap rows per category in recap")
+    sp.add_argument("--global", dest="global_", action="store_true",
+                    help="include cross-project memories")
+    sp.add_argument("--no-messages", dest="no_messages", action="store_true",
+                    help="omit recent conversation tail from recap")
+    sp.add_argument("--retries", type=int, default=2,
+                    help="ack retry attempts per step (default 2)")
+    sp.add_argument("--resume-from", dest="resume_from", type=int, default=0,
+                    help="skip ahead to this chunk (1-indexed); 0 = full run from preamble")
+    sp.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="print chunk plan without sending anything")
+    sp.add_argument("--session", help="project to push (default: CWD)")
+    sp.set_defaults(func=cmd_push_gpt)
 
     sp = sub.add_parser("menu", parents=[common],
                         help="session-start menu (designed for AskUserQuestion)")
