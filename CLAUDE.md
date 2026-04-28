@@ -35,6 +35,33 @@ buck-context sessions list                      # what projects exist
 
 GPT can also curate memories — emit `MEMORY[<category>]: <one-line content>` in any reply and buck-review.sh persists it via `buck-context write --key=gpt-suggested`.
 
+**Send the current project context to a fresh GPT thread:**
+```bash
+buck-context push-gpt --channel=a              # chunked READY/ACK/LOADED handoff
+buck-context push-gpt --channel=a --dry-run    # show chunk plan without sending
+buck-context push-gpt --resume-from=4          # resume after a partial failure
+```
+Use this when starting a new ChatGPT thread that needs the project's history. Default chunk size 20 000 chars; the multi-step protocol is logged into `messages` like any other exchange.
+
+**Archive / restore project state (STRATA-compressed snapshots):**
+```bash
+buck-context archive --title="post-X-launch"   # snapshot memories + last 200 messages
+buck-context archives list                      # browse by date
+buck-context archives view <id>                 # markdown render
+buck-context archives restore <id>              # additive restore (audit-tracked)
+buck-context archives export <id> > snap.json  # portable BUCKCTX1 envelope
+buck-context archives import < snap.json
+buck-context archives delete <id>
+```
+Compresses with the user's STRATA codec when available (`~/AI_Projects/STRATA/strata.py`), falls back to zlib. ~90% smaller than raw JSON for typical transcripts.
+
+**Compact old chat into summaries (memories never touched):**
+```bash
+buck-context compact --dry-run                  # preview eligible messages, no writes
+buck-context compact --chat-older=14d --keep-last=200 --model=qwen2.5:7b-instruct
+```
+Lossily summarises old `messages` rows via local Ollama into `memories.category='chat_summary'` rows, then deletes the originals. Categorised memories (`must_do`, `do_dont`, `server_config`, `decision`, etc.) are NEVER touched. Aborts cleanly with no deletions if Ollama is unreachable.
+
 ## What is Buck?
 Buck is a macOS menu bar app that sends messages to AI apps (ChatGPT, Cursor) via the Accessibility API, or directly to the OpenAI Responses API (Codex channel), and returns responses. It removes the manual copy-paste loop.
 
