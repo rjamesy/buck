@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+"""
+buck-context — persistent project-scoped memory and conversation log for the
+Claude / GPT / Codex workflow. Single-file CLI, stdlib only (sqlite3 + json
++ argparse). Backing store: ~/.buck/memory.db.
+
+Curriculum L1 covers init / status / write / list / update / delete / recap /
+search / log / prune / doctor / sessions, with cross-session retrieval flags
+(--session=PATH, --all-sessions). Higher Ls layer on top.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import sqlite3
+import sys
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+# ---------- paths ----------
+
+DB_PATH = Path.home() / ".buck" / "memory.db"
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# Curated category order for `recap`. Anything not in this list is appended
+# alphabetically at the end. Strings only — categories are not CHECKed at
+# the schema level (additive enum).
+RECAP_ORDER = [
+    "current_state",
+    "must_do",
+    "do_dont",
+    "server_config",
+    "must_read",
+    "decision",
+    "open_question",
+    "failed_approach",
+    "plan",
+    "code_location",
+    "tool_pref",
+    "workflow",
+    "permission",
+    "persona",
+    "external_ref",
+    "glossary",
+    "fact",
+    "chat_summary",
+]
+
+# ---------- helpers ----------
+
+
+def now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_duration(s: str) -> _dt.timedelta:
+    """Parse '7d', '24h', '15m', '90s' into a timedelta."""
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd])\s*", s)
+    if not m:
+        raise ValueError(f"bad duration: {s!r}; use '7d', '24h', '15m', '90s'")
+    n = int(m.group(1))
+    unit = m.group(2)
+    return {"s": _dt.timedelta(seconds=n),
+            "m": _dt.timedelta(minutes=n),
+            "h": _dt.timedelta(hours=n),
+            "d": _dt.timedelta(days=n)}[unit]
+
+
+def expand_path(p: str) -> str:
+    """Resolve ~ + relative + symlink-free abspath."""
+    return str(Path(os.path.expanduser(p)).resolve())
+
+
+def cwd_project() -> str:
+    return expand_path(os.getcwd())
+
+
+# ---------- database ----------
+
+
+SCHEMA_V1 = """
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS projects (
+    path           TEXT PRIMARY KEY,
+    title          TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    last_active_at TEXT NOT NULL,
+    summary        TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project     TEXT NOT NULL REFERENCES projects(path) ON DELETE CASCADE,
+    request_id  TEXT,
+    agent       TEXT NOT NULL CHECK(agent IN
+                ('user','claude','gpt','codex','buck')),
+    direction   TEXT NOT NULL CHECK(direction IN ('out','in')),
+    channel     TEXT,
+    status      TEXT,
+    content     TEXT NOT NULL,
+    tokens_in   INTEGER,
+    tokens_out  INTEGER,
+    timestamp   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_project_time ON messages(project, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_request ON messages(request_id);
+
+CREATE TABLE IF NOT EXISTS memories (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project     TEXT REFERENCES projects(path) ON DELETE CASCADE,
+    category    TEXT NOT NULL,
+    key         TEXT,
+    content     TEXT NOT NULL,
+    importance  INTEGER NOT NULL DEFAULT 5,
+    expires_at  TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memories_project_cat ON memories(project, category);
+
+CREATE TABLE IF NOT EXISTS memories_audit (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id     INTEGER,
+    action        TEXT NOT NULL CHECK(action IN ('create','update','delete')),
+    content_before TEXT,
+    content_after  TEXT,
+    timestamp      TEXT NOT NULL
+);
+"""
+
+
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Idempotent schema migrations keyed on PRAGMA user_version."""
+    cur = conn.execute("PRAGMA user_version")
+    version = cur.fetchone()[0]
+    if version < 1:
+        conn.executescript(SCHEMA_V1)
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+
+
+def ensure_project(conn: sqlite3.Connection, path: str) -> str:
+    """Insert a projects row if missing; bump last_active_at; return path."""
+    title = Path(path).name or path
+    now = now_iso()
+    conn.execute(
+        """
+        INSERT INTO projects (path, title, created_at, last_active_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET last_active_at = excluded.last_active_at
+        """,
+        (path, title, now, now),
+    )
+    conn.commit()
+    return path
+
+
+def resolve_project(arg: Optional[str]) -> str:
+    """Expand --session=PATH or fall back to CWD."""
+    if arg:
+        return expand_path(arg)
+    return cwd_project()
+
+
+def resolve_project_prefix(conn: sqlite3.Connection, q: str) -> str:
+    """For 'sessions show <prefix>': accept exact path, abspath, or unique
+    suffix-match across registered projects."""
+    full = expand_path(q) if (q.startswith("/") or q.startswith("~")) else None
+    if full:
+        row = conn.execute("SELECT path FROM projects WHERE path = ?", (full,)).fetchone()
+        if row:
+            return row["path"]
+    # Fall through to suffix or substring match.
+    rows = conn.execute("SELECT path FROM projects").fetchall()
+    suffix_matches = [r["path"] for r in rows if r["path"].endswith(q) or q in r["path"]]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    if len(suffix_matches) == 0:
+        die(f"no project matches {q!r}")
+    die(f"ambiguous prefix {q!r} matches: {', '.join(suffix_matches)}")
+    return ""  # unreachable
+
+
+# ---------- output ----------
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"buck-context: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def emit(rows: Iterable[Any], json_mode: bool, fields: Optional[list[str]] = None) -> None:
+    if json_mode:
+        if fields:
+            data = [{f: r[f] for f in fields} for r in rows]
+        else:
+            data = [dict(r) for r in rows] if rows else []
+        json.dump(data, sys.stdout, indent=2, default=str)
+        sys.stdout.write("\n")
+        return
+    rows = list(rows)
+    if not rows:
+        return
+    cols = fields or list(rows[0].keys())
+    widths = {c: max(len(c), max(len(str(r[c] if r[c] is not None else "")) for r in rows)) for c in cols}
+    print("  ".join(c.ljust(widths[c]) for c in cols))
+    print("  ".join("-" * widths[c] for c in cols))
+    for r in rows:
+        print("  ".join(str(r[c] if r[c] is not None else "").ljust(widths[c]) for c in cols))
+
+
+# ---------- commands ----------
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    """Register CWD (or --path) as a project."""
+    target = expand_path(args.path) if args.path else cwd_project()
+    conn = connect()
+    migrate(conn)
+    ensure_project(conn, target)
+    title = Path(target).name or target
+    out = {"path": target, "title": title}
+    if args.json:
+        json.dump(out, sys.stdout)
+        sys.stdout.write("\n")
+    else:
+        print(f"buck-context project: {title}\n  path: {target}\n  db:   {DB_PATH}")
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    proj = resolve_project(args.session)
+    conn = connect()
+    migrate(conn)
+    p = conn.execute("SELECT * FROM projects WHERE path = ?", (proj,)).fetchone()
+    if not p:
+        die(f"project not registered: {proj}\n  Run: buck-context init")
+    mem = conn.execute("SELECT COUNT(*) c FROM memories WHERE project = ?", (proj,)).fetchone()["c"]
+    msgs = conn.execute("SELECT COUNT(*) c FROM messages WHERE project = ?", (proj,)).fetchone()["c"]
+    if args.json:
+        json.dump({"path": p["path"], "title": p["title"], "memories": mem,
+                   "messages": msgs, "last_active_at": p["last_active_at"]},
+                  sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print(f"Project: {p['title']}")
+        print(f"  Path:        {p['path']}")
+        print(f"  Memories:    {mem}")
+        print(f"  Messages:    {msgs}")
+        print(f"  Last active: {p['last_active_at']}")
+
+
+def cmd_write(args: argparse.Namespace) -> None:
+    if args.global_:
+        proj_value: Optional[str] = None
+    else:
+        proj_value = resolve_project(args.session)
+        ensure_project(connect(), proj_value)  # idempotent
+    expires = None
+    if args.expires:
+        expires = (_dt.datetime.now(_dt.timezone.utc) + parse_duration(args.expires)) \
+                    .strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not args.content or not args.content.strip():
+        die("empty content; pass content as the second positional argument")
+    if not 1 <= args.importance <= 10:
+        die(f"importance must be 1..10, got {args.importance}")
+
+    now = now_iso()
+    conn = connect()
+    migrate(conn)
+    cur = conn.execute(
+        """
+        INSERT INTO memories
+            (project, category, key, content, importance, expires_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (proj_value, args.category, args.key, args.content,
+         args.importance, expires, now, now),
+    )
+    mem_id = cur.lastrowid
+    conn.execute(
+        """
+        INSERT INTO memories_audit (memory_id, action, content_before, content_after, timestamp)
+        VALUES (?, 'create', NULL, ?, ?)
+        """,
+        (mem_id, args.content, now),
+    )
+    conn.commit()
+
+    if args.json:
+        json.dump({"id": mem_id, "category": args.category, "key": args.key,
+                   "project": proj_value, "expires_at": expires},
+                  sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print(f"wrote memory id={mem_id}  category={args.category}  "
+              f"key={args.key or '-'}  project={proj_value or '<global>'}")
+
+
+def _list_query(proj: Optional[str], scope: str, args: argparse.Namespace) -> tuple[str, list]:
+    """Build SELECT for `list` based on scope (this|session|all|global)."""
+    base = ("SELECT id, project, category, key, content, importance, "
+            "expires_at, updated_at FROM memories")
+    where = []
+    params: list = []
+    if scope == "this":
+        where.append("project = ?"); params.append(proj)
+    elif scope == "session":
+        where.append("project = ?"); params.append(args.session_resolved)
+    elif scope == "global":
+        where.append("project IS NULL")
+    # scope == "all": no project filter
+    if args.cat:
+        where.append("category = ?"); params.append(args.cat)
+    if args.key:
+        where.append("key = ?"); params.append(args.key)
+    sql = base + (" WHERE " + " AND ".join(where) if where else "")
+    sql += " ORDER BY importance DESC, updated_at DESC"
+    return sql, params
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    conn = connect(); migrate(conn)
+    if args.all_sessions:
+        scope = "all"
+        proj = None
+    elif args.session:
+        scope = "session"
+        args.session_resolved = expand_path(args.session)
+        proj = args.session_resolved
+    elif args.global_:
+        scope = "global"
+        proj = None
+    else:
+        scope = "this"
+        proj = resolve_project(None)
+    sql, params = _list_query(proj, scope, args)
+    rows = conn.execute(sql, params).fetchall()
+    fields = ["id", "project", "category", "key", "content", "importance", "expires_at", "updated_at"]
+    if scope == "this":
+        # Drop the project column; it's redundant when scoped to current.
+        fields.remove("project")
+    # Truncate content for tabular display.
+    if not args.json:
+        rows = [dict(r) for r in rows]
+        for r in rows:
+            if r.get("content") and len(r["content"]) > 80:
+                r["content"] = r["content"][:77] + "..."
+    emit(rows, args.json, fields)
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    conn = connect(); migrate(conn)
+    row = conn.execute("SELECT id, content FROM memories WHERE id = ?", (args.id,)).fetchone()
+    if not row:
+        die(f"no memory with id={args.id}")
+    if not args.content or not args.content.strip():
+        die("empty new content")
+    now = now_iso()
+    conn.execute("UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
+                 (args.content, now, args.id))
+    conn.execute(
+        """
+        INSERT INTO memories_audit (memory_id, action, content_before, content_after, timestamp)
+        VALUES (?, 'update', ?, ?, ?)
+        """, (args.id, row["content"], args.content, now))
+    conn.commit()
+    if args.json:
+        json.dump({"id": args.id, "updated": True}, sys.stdout); sys.stdout.write("\n")
+    else:
+        print(f"updated memory id={args.id}")
+
+
+def cmd_delete(args: argparse.Namespace) -> None:
+    conn = connect(); migrate(conn)
+    row = conn.execute("SELECT id, content FROM memories WHERE id = ?", (args.id,)).fetchone()
+    if not row:
+        die(f"no memory with id={args.id}")
+    now = now_iso()
+    conn.execute(
+        """
+        INSERT INTO memories_audit (memory_id, action, content_before, content_after, timestamp)
+        VALUES (?, 'delete', ?, ?, ?)
+        """,
+        (args.id, row["content"], args.reason or "", now))
+    conn.execute("DELETE FROM memories WHERE id = ?", (args.id,))
+    conn.commit()
+    if args.json:
+        json.dump({"id": args.id, "deleted": True}, sys.stdout); sys.stdout.write("\n")
+    else:
+        print(f"deleted memory id={args.id}")
+
+
+def cmd_recap(args: argparse.Namespace) -> None:
+    conn = connect(); migrate(conn)
+    proj = resolve_project(args.session)
+    p = conn.execute("SELECT * FROM projects WHERE path = ?", (proj,)).fetchone()
+    if not p:
+        # Render a "no project" recap rather than exit-erroring; lets Claude
+        # call recap on a fresh dir without failure.
+        print(f"# Project: {Path(proj).name}\n  (not yet initialised — run `buck-context init`)\n")
+        return
+
+    rows = conn.execute(
+        "SELECT * FROM memories WHERE project = ? "
+        "ORDER BY importance DESC, updated_at DESC",
+        (proj,)
+    ).fetchall()
+    by_cat: dict[str, list] = {}
+    for r in rows:
+        by_cat.setdefault(r["category"], []).append(r)
+    if args.global_:
+        for r in conn.execute(
+            "SELECT * FROM memories WHERE project IS NULL "
+            "ORDER BY importance DESC, updated_at DESC"
+        ).fetchall():
+            by_cat.setdefault(r["category"], []).append(r)
+
+    out: list[str] = []
+    out.append(f"# Project: {p['title']}")
+    out.append(f"_path: {p['path']}_   _last active: {p['last_active_at']}_")
+    if p["summary"]:
+        out.append(f"\n**Summary.** {p['summary']}")
+
+    seen_cats: set[str] = set()
+    ordered = [c for c in RECAP_ORDER if c in by_cat] + sorted(c for c in by_cat if c not in RECAP_ORDER)
+    for cat in ordered:
+        if cat in seen_cats:
+            continue
+        seen_cats.add(cat)
+        items = by_cat[cat][: args.max] if args.max else by_cat[cat]
+        if not items:
+            continue
+        out.append(f"\n## {cat.replace('_', ' ').title()}")
+        for r in items:
+            tag = f" `[{r['key']}]`" if r["key"] else ""
+            out.append(f"- _#{r['id']}_  {r['content']}{tag}  _(imp {r['importance']})_")
+
+    # Recent messages tail.
+    recent = conn.execute(
+        "SELECT direction, agent, status, content, timestamp "
+        "FROM messages WHERE project = ? ORDER BY id DESC LIMIT ?",
+        (proj, max(args.max or 10, 10)),
+    ).fetchall()
+    if recent:
+        out.append("\n## Recent Conversation")
+        for r in reversed(recent):
+            arrow = "→" if r["direction"] == "out" else "←"
+            preview = (r["content"] or "").replace("\n", " ")[:120]
+            out.append(f"- {r['timestamp']} {arrow} {r['agent']} "
+                       f"{('('+r['status']+')') if r['status'] else ''} {preview}")
+
+    print("\n".join(out))
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    conn = connect(); migrate(conn)
+    where = ["(content LIKE ? OR key LIKE ?)"]
+    params: list = [f"%{args.query}%", f"%{args.query}%"]
+    if args.cat:
+        where.append("category = ?"); params.append(args.cat)
+    if args.all_sessions:
+        pass
+    elif args.session:
+        where.append("project = ?"); params.append(expand_path(args.session))
+    else:
+        where.append("project = ?"); params.append(resolve_project(None))
+    sql = ("SELECT id, project, category, key, content, importance, updated_at "
+           "FROM memories WHERE " + " AND ".join(where) +
+           " ORDER BY importance DESC, updated_at DESC")
+    rows = conn.execute(sql, params).fetchall()
+    fields = ["id", "project", "category", "key", "content", "importance", "updated_at"]
+    if not args.all_sessions:
+        fields.remove("project")
+    if not args.json:
+        rows = [dict(r) for r in rows]
+        for r in rows:
+            if r.get("content") and len(r["content"]) > 100:
+                r["content"] = r["content"][:97] + "..."
+    emit(rows, args.json, fields)
+
+
+def cmd_log(args: argparse.Namespace) -> None:
+    conn = connect(); migrate(conn)
+    where = []
+    params: list = []
+    if args.all_sessions:
+        pass
+    elif args.session:
+        where.append("project = ?"); params.append(expand_path(args.session))
+    else:
+        where.append("project = ?"); params.append(resolve_project(None))
+    if args.since:
+        where.append("timestamp >= ?"); params.append(args.since)
+    sql = ("SELECT id, project, request_id, direction, agent, channel, status, "
+           "substr(content, 1, 120) AS content, timestamp FROM messages")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(args.n)
+    rows = conn.execute(sql, params).fetchall()
+    fields = ["id", "project", "request_id", "direction", "agent", "channel", "status", "content", "timestamp"]
+    if not args.all_sessions:
+        fields.remove("project")
+    emit(rows, args.json, fields)
+
+
+def cmd_sessions(args: argparse.Namespace) -> None:
+    conn = connect(); migrate(conn)
+    if args.action == "list":
+        rows = conn.execute(
+            """
+            SELECT
+              p.path AS path,
+              p.title AS title,
+              p.last_active_at AS last_active,
+              (SELECT COUNT(*) FROM memories WHERE memories.project = p.path) AS memories,
+              (SELECT COUNT(*) FROM messages WHERE messages.project = p.path) AS messages
+            FROM projects p
+            ORDER BY p.last_active_at DESC
+            """).fetchall()
+        emit(rows, args.json, ["path", "title", "memories", "messages", "last_active"])
+    elif args.action == "show":
+        full = resolve_project_prefix(conn, args.path)
+        # Reuse cmd_recap with the path overridden.
+        ns = argparse.Namespace(session=full, max=args.max, global_=False, json=args.json)
+        cmd_recap(ns)
+    else:
+        die(f"unknown sessions action: {args.action}")
+
+
+def cmd_prune(args: argparse.Namespace) -> None:
+    conn = connect(); migrate(conn)
+    n = conn.execute(
+        "SELECT COUNT(*) c FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?",
+        (now_iso(),)
+    ).fetchone()["c"]
+    if not args.dry_run:
+        conn.execute("DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?",
+                     (now_iso(),))
+        conn.commit()
+    if args.json:
+        json.dump({"pruned": n, "dry_run": bool(args.dry_run)}, sys.stdout); sys.stdout.write("\n")
+    else:
+        word = "would prune" if args.dry_run else "pruned"
+        print(f"{word} {n} expired memories")
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    conn = connect(); migrate(conn)
+    counts = {
+        "projects": conn.execute("SELECT COUNT(*) c FROM projects").fetchone()["c"],
+        "memories": conn.execute("SELECT COUNT(*) c FROM memories").fetchone()["c"],
+        "memories_audit": conn.execute("SELECT COUNT(*) c FROM memories_audit").fetchone()["c"],
+        "messages": conn.execute("SELECT COUNT(*) c FROM messages").fetchone()["c"],
+    }
+    # Orphan checks.
+    orphan_messages = conn.execute(
+        "SELECT COUNT(*) c FROM messages "
+        "WHERE project NOT IN (SELECT path FROM projects)"
+    ).fetchone()["c"]
+    orphan_memories = conn.execute(
+        "SELECT COUNT(*) c FROM memories "
+        "WHERE project IS NOT NULL AND project NOT IN (SELECT path FROM projects)"
+    ).fetchone()["c"]
+    pragma_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    out = {
+        "db_path": str(DB_PATH),
+        "db_size_bytes": db_size,
+        "pragma_user_version": pragma_version,
+        "counts": counts,
+        "orphan_messages": orphan_messages,
+        "orphan_memories": orphan_memories,
+        "status": "OK" if orphan_messages == 0 and orphan_memories == 0 else "WARN",
+    }
+    if args.json:
+        json.dump(out, sys.stdout, indent=2); sys.stdout.write("\n")
+    else:
+        print(f"db: {DB_PATH} ({db_size:,} B)  schema_v{pragma_version}  status: {out['status']}")
+        for k, v in counts.items():
+            print(f"  {k:16s} {v}")
+        if orphan_messages or orphan_memories:
+            print(f"  orphan_messages  {orphan_messages}")
+            print(f"  orphan_memories  {orphan_memories}")
+
+
+# ---------- argparse plumbing ----------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # Common parent provides --json on every sub-command so callers can write
+    # `buck-context list --json` (after the subcommand) as well as before.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="machine-readable output")
+
+    p = argparse.ArgumentParser(
+        prog="buck-context",
+        parents=[common],
+        description="Persistent project context for the Claude / GPT / Codex workflow.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("init", parents=[common], help="register a project (default: CWD)")
+    sp.add_argument("--path", help="project path (default: CWD)")
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("status", parents=[common], help="brief project status")
+    sp.add_argument("--session", help="path of project (default: CWD)")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("write", parents=[common], help="add a memory")
+    sp.add_argument("category", help="must_do, do_dont, server_config, …")
+    sp.add_argument("content", help="memory body")
+    sp.add_argument("--key", help="short tag")
+    sp.add_argument("--importance", type=int, default=5, help="1..10")
+    sp.add_argument("--expires", help="duration: 7d, 24h, 15m, 90s")
+    sp.add_argument("--global", dest="global_", action="store_true",
+                    help="cross-project memory")
+    sp.add_argument("--session", help="target project (default: CWD)")
+    sp.set_defaults(func=cmd_write)
+
+    sp = sub.add_parser("list", parents=[common], help="list memories")
+    sp.add_argument("--cat", help="filter by category")
+    sp.add_argument("--key", help="filter by key")
+    sp.add_argument("--global", dest="global_", action="store_true")
+    sp.add_argument("--session", help="restrict to specific project")
+    sp.add_argument("--all-sessions", action="store_true",
+                    help="search every project (shows project column)")
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("update", parents=[common], help="replace a memory's content")
+    sp.add_argument("id", type=int)
+    sp.add_argument("content")
+    sp.set_defaults(func=cmd_update)
+
+    sp = sub.add_parser("delete", parents=[common], help="hard-delete a memory (audited)")
+    sp.add_argument("id", type=int)
+    sp.add_argument("--reason", help="audit note")
+    sp.set_defaults(func=cmd_delete)
+
+    sp = sub.add_parser("recap", parents=[common], help="markdown brief of project state")
+    sp.add_argument("--max", type=int, default=20, help="cap rows per category")
+    sp.add_argument("--global", dest="global_", action="store_true",
+                    help="include cross-project memories")
+    sp.add_argument("--session", help="recap a specific project")
+    sp.set_defaults(func=cmd_recap)
+
+    sp = sub.add_parser("search", parents=[common], help="LIKE-search memories")
+    sp.add_argument("query")
+    sp.add_argument("--cat", help="restrict to category")
+    sp.add_argument("--session", help="restrict to specific project")
+    sp.add_argument("--all-sessions", action="store_true")
+    sp.set_defaults(func=cmd_search)
+
+    sp = sub.add_parser("log", parents=[common], help="recent messages")
+    sp.add_argument("--n", type=int, default=20)
+    sp.add_argument("--since", help="ISO8601 cutoff")
+    sp.add_argument("--session", help="restrict to specific project")
+    sp.add_argument("--all-sessions", action="store_true")
+    sp.set_defaults(func=cmd_log)
+
+    sp = sub.add_parser("sessions", parents=[common], help="enumerate or show projects")
+    ssub = sp.add_subparsers(dest="action", required=True)
+    ssp = ssub.add_parser("list", parents=[common], help="list registered projects")
+    ssp.set_defaults(func=cmd_sessions)
+    ssp = ssub.add_parser("show", parents=[common], help="recap a specific project")
+    ssp.add_argument("path", help="project path or unique substring")
+    ssp.add_argument("--max", type=int, default=20)
+    ssp.set_defaults(func=cmd_sessions)
+
+    sp = sub.add_parser("prune", parents=[common], help="delete expired memories")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.set_defaults(func=cmd_prune)
+
+    sp = sub.add_parser("doctor", parents=[common], help="schema + integrity check")
+    sp.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    # `--json` is on the top-level parser; all subcommands inherit it via Namespace.
+    if not hasattr(args, "json"):
+        args.json = False
+    # `sessions` has nested action; consolidate so command code can read args.action.
+    if args.cmd == "sessions" and not hasattr(args, "action"):
+        args.action = None
+    try:
+        args.func(args)
+    except sqlite3.Error as e:
+        die(f"sqlite error: {e}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
