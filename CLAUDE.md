@@ -1,5 +1,40 @@
 # Buck — Claude ↔ AI Review Bridge
 
+## Buck Context (session-start bootstrap)
+This project uses **buck-context** for cross-session persistent memory + conversation log. Backing store: `~/.buck/memory.db` (SQLite), keyed on the project's absolute path.
+
+**At session start, before answering anything**, run:
+```bash
+~/Mac\ Projects/buck/buck-context menu --json
+```
+Parse the JSON and present the `options[]` to the user via `AskUserQuestion` (multi-select). Each option has `key`, `label`, `desc`, `command`, `available`. Skip pending items (`available: false`) unless explicitly asked. After the user picks, run the corresponding `command` and incorporate the output into the conversation context. If they pick `skip`, proceed normally.
+
+**During the session**, write structured state as it accrues:
+```bash
+buck-context write current_state "we're mid-refactor of X; tests passing on Y"
+buck-context write must_do "wire up Z before commit"
+buck-context write do_dont "never delete .build/ during a long inference run"
+buck-context write server_config "AI server: rjamesy@100.103.104.48" --key=ai-server
+buck-context write decision "chose render-stable hash over AX identifier" --importance=8
+buck-context update <id> "..."          # refine an existing memory
+buck-context delete <id> --reason=...   # remove redundant
+```
+
+Categories (additive, not strict): `must_do`, `must_read`, `do_dont`, `server_config`, `current_state`, `decision`, `failed_approach`, `plan`, `open_question`, `glossary`, `code_location`, `tool_pref`, `workflow`, `permission`, `persona`, `external_ref`, `fact`. Use `--global` for cross-project memories.
+
+**Cross-session retrieval** (Claude can pull context from other projects):
+```bash
+buck-context recap                              # current project
+buck-context recap --session=<path>             # different project
+buck-context list --all-sessions --cat=server_config
+buck-context search "ai-server" --all-sessions
+buck-context sessions list                      # what projects exist
+```
+
+**Conversation log** is automatic: `buck-review.sh` writes every Claude→GPT→Claude exchange into `messages` keyed on the same project path. Recent tail surfaces in `recap` and via `buck-context log --n=20`.
+
+GPT can also curate memories — emit `MEMORY[<category>]: <one-line content>` in any reply and buck-review.sh persists it via `buck-context write --key=gpt-suggested`.
+
 ## What is Buck?
 Buck is a macOS menu bar app that sends messages to AI apps (ChatGPT, Cursor) via the Accessibility API, or directly to the OpenAI Responses API (Codex channel), and returns responses. It removes the manual copy-paste loop.
 
