@@ -112,6 +112,12 @@ if [[ -z "$CONTENT" ]]; then
     exit 1
 fi
 
+# L2.1 — auto-resolve session from CWD when not explicitly set. Stable per
+# project across terminal launches; buck-context keys all rows on this path.
+if [[ -z "$SESSION_ID" ]]; then
+    SESSION_ID="$(pwd -P)"
+fi
+
 # Check Buck is running
 if ! pgrep -x Buck > /dev/null 2>&1; then
     echo "Error: Buck is not running. Launch it from /Applications/Buck.app" >&2
@@ -120,6 +126,60 @@ fi
 
 # Ensure directories exist
 mkdir -p "$INBOX" "$OUTBOX"
+
+# ─── buck-context bridge (L2 logging) ────────────────────────────────
+BUCK_CONTEXT="$(dirname "$0")/buck-context"
+
+# Map a buck channel name to the schema-allowed agent enum
+# (user|claude|gpt|codex|buck). Cursor is treated as gpt-class for now.
+bc_agent_for_channel() {
+    case "${1:-}" in
+        codex)  echo "codex" ;;
+        cursor) echo "gpt" ;;
+        *)      echo "gpt" ;;
+    esac
+}
+
+# Insert a single message row into ~/.buck/memory.db via buck-context.
+# Errors are swallowed — DB unavailability must never break the buck-review
+# round-trip. Args:
+#   $1 direction   out | in
+#   $2 agent       user|claude|gpt|codex|buck
+#   $3 channel     a|b|cursor|codex|""
+#   $4 status      approved|feedback|error|""
+#   $5 request_id
+#   $6 content     (string passed via stdin to dodge arg-length limits)
+bc_log_msg() {
+    [[ -x "$BUCK_CONTEXT" ]] || return 0
+    printf '%s' "$6" | "$BUCK_CONTEXT" message-add \
+        --direction="$1" --agent="$2" \
+        --channel="$3" --status="$4" --request-id="$5" \
+        --session="$SESSION_ID" --content-stdin >/dev/null 2>&1 || true
+}
+
+# Scan a response body for `MEMORY[<cat>]: <content>` lines and persist each
+# via `buck-context write`. This is the bidirectional path: GPT can curate
+# the project's memory bank by emitting structured markers in its replies.
+# Implemented in Python because macOS ships bash 3.2 with broken BASH_REMATCH
+# capture groups; python3 is already a hard dep of this script.
+bc_parse_memory_writes() {
+    [[ -x "$BUCK_CONTEXT" ]] || return 0
+    printf '%s' "$1" | python3 -c '
+import re, subprocess, sys
+bc, session = sys.argv[1], sys.argv[2]
+text = sys.stdin.read()
+for m in re.finditer(r"^MEMORY\[([a-z_]+)\]:\s*(.+?)\s*$", text, re.MULTILINE):
+    cat, content = m.group(1), m.group(2).strip()
+    if not content:
+        continue
+    subprocess.run(
+        [bc, "write", cat, content,
+         "--key=gpt-suggested", "--importance=6",
+         f"--session={session}"],
+        check=False,
+    )
+' "$BUCK_CONTEXT" "$SESSION_ID" 2>/dev/null || true
+}
 
 # ─── Logging helpers ────────────────────────────────────────────────
 
@@ -162,6 +222,10 @@ print(json.dumps(entry))
 
     cat "$tmp_log" >> "$HISTORY"
     rm -f "$tmp_log"
+
+    # L2.2 — also log the inbound message into ~/.buck/memory.db. Best-effort.
+    bc_log_msg in "$(bc_agent_for_channel "$CHANNEL")" "$CHANNEL" "$status" \
+        "$request_id" "$response_text"
 }
 
 # Validate response JSON: must be valid JSON with required fields
@@ -241,6 +305,11 @@ while [ $attempt -le $MAX_RETRIES ]; do
 }
 ENDJSON
     mv "$INBOX/$ID.tmp" "$INBOX/$ID.json"
+
+    # L2.2 — log the outbound request into ~/.buck/memory.db. Stores prompt
+    # + content joined so a future query has the full payload context.
+    bc_log_msg out "${CALLER:-claude}" "$CHANNEL" "" "$ID" \
+        "$(printf '%s\n---\n%s' "$PROMPT" "$CONTENT_WRAPPED")"
 
     # Display name based on channel
     DISPLAY_TARGET="ChatGPT"
@@ -351,6 +420,10 @@ with open('$OUTBOX/$ID.json', 'w') as f: json.dump(d, f, indent=2)
         # Log the exchange
         RESPONSE_TEXT=$(python3 -c "import json; print(json.load(open('$OUTBOX/$ID.json')).get('response',''))" 2>/dev/null || echo "")
         log_exchange "$ID" "$STATUS" "$RESPONSE_TEXT"
+
+        # L2.3 — scan response for `MEMORY[<cat>]: <content>` lines and
+        # persist each via buck-context. Lets GPT curate project memory.
+        bc_parse_memory_writes "$RESPONSE_TEXT"
 
         # Smoke test: validate response contains "OK"
         if $SMOKE_TEST; then

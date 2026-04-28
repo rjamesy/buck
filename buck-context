@@ -540,6 +540,48 @@ def cmd_sessions(args: argparse.Namespace) -> None:
         die(f"unknown sessions action: {args.action}")
 
 
+def cmd_message_add(args: argparse.Namespace) -> None:
+    """Internal: insert a row into messages. Used by buck-review.sh to log
+    every exchange. Auto-creates the project row so callers don't need to
+    init explicitly."""
+    proj = resolve_project(args.session)
+    conn = connect(); migrate(conn)
+    ensure_project(conn, proj)
+
+    # Resolve content from --content or stdin.
+    content: str
+    if args.content_stdin:
+        content = sys.stdin.read()
+    elif args.content is not None:
+        content = args.content
+    else:
+        die("provide --content or --content-stdin")
+
+    # Map permissive agent names to the schema-allowed enum.
+    agent_map = {"chatgpt": "gpt", "cursor": "gpt"}
+    agent = agent_map.get(args.agent, args.agent)
+    if agent not in ("user", "claude", "gpt", "codex", "buck"):
+        die(f"unknown agent: {args.agent}")
+
+    cur = conn.execute(
+        """
+        INSERT INTO messages
+            (project, request_id, agent, direction, channel, status,
+             content, tokens_in, tokens_out, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (proj, args.request_id, agent, args.direction, args.channel,
+         args.status, content, args.tokens_in, args.tokens_out, now_iso()),
+    )
+    msg_id = cur.lastrowid
+    conn.commit()
+
+    if args.json:
+        json.dump({"id": msg_id, "project": proj}, sys.stdout); sys.stdout.write("\n")
+    else:
+        print(f"logged msg id={msg_id}  {args.direction} {agent}")
+
+
 def cmd_prune(args: argparse.Namespace) -> None:
     conn = connect(); migrate(conn)
     n = conn.execute(
@@ -679,6 +721,22 @@ def build_parser() -> argparse.ArgumentParser:
     ssp.add_argument("path", help="project path or unique substring")
     ssp.add_argument("--max", type=int, default=20)
     ssp.set_defaults(func=cmd_sessions)
+
+    sp = sub.add_parser("message-add", parents=[common],
+                        help="(internal) log a message — used by buck-review.sh")
+    sp.add_argument("--direction", required=True, choices=["out", "in"])
+    sp.add_argument("--agent", required=True,
+                    help="user|claude|gpt|codex|buck (chatgpt/cursor mapped to gpt)")
+    sp.add_argument("--channel")
+    sp.add_argument("--status")
+    sp.add_argument("--request-id", dest="request_id")
+    sp.add_argument("--session", help="project path (default: CWD)")
+    sp.add_argument("--content", help="message body")
+    sp.add_argument("--content-stdin", action="store_true",
+                    help="read content from stdin instead of --content")
+    sp.add_argument("--tokens-in", dest="tokens_in", type=int)
+    sp.add_argument("--tokens-out", dest="tokens_out", type=int)
+    sp.set_defaults(func=cmd_message_add)
 
     sp = sub.add_parser("prune", parents=[common], help="delete expired memories")
     sp.add_argument("--dry-run", action="store_true")
